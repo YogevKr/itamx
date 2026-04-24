@@ -47,6 +47,28 @@ def _format_time(iso_ts: str) -> str:
     return f"{date[5:]} {time[:5]}"
 
 
+def _extract_rbd(booking_details: dict | None) -> str:
+    """Format RBD letters per slice from a bookingDetails response.
+
+    Each slice can have multiple segments; we take all bookingCodes per slice
+    and join with '/'. Slices joined with ' | '.
+    """
+    if not booking_details:
+        return "—"
+    if "error" in booking_details:
+        return f"err"
+    out_parts: list[str] = []
+    for slice_ in booking_details.get("itinerary", {}).get("slices", []):
+        codes = []
+        for seg in slice_.get("segments", []):
+            for bi in seg.get("bookingInfos", []):
+                code = bi.get("bookingCode")
+                if code:
+                    codes.append(code)
+        out_parts.append("/".join(codes) if codes else "?")
+    return " | ".join(out_parts) if out_parts else "—"
+
+
 @app.command()
 def search(
     origin: Annotated[str, typer.Argument(help="Source IATA code")],
@@ -79,6 +101,14 @@ def search(
         str, typer.Option("--output", "-o", help="text | json | raw")
     ] = "text",
     top: Annotated[int, typer.Option("--top", help="Rows to show in text mode")] = 15,
+    detail: Annotated[
+        int,
+        typer.Option(
+            "--detail", "-d",
+            help="Fetch fare-class detail for the top N solutions (extra round-trip per solution).",
+            min=0, max=20,
+        ),
+    ] = 0,
 ) -> None:
     """Search flights. Returns a price-sorted table of solutions."""
     origin = origin.upper()
@@ -99,6 +129,29 @@ def search(
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
             raise typer.Exit(1)
+
+        # Fetch fare-class detail for the top N solutions if requested
+        details_by_id: dict[str, dict] = {}
+        if detail > 0:
+            sols_for_detail = raw.get("solutionList", {}).get("solutions", [])
+            sols_for_detail = sorted(
+                sols_for_detail,
+                key=lambda s: _price_float(s.get("displayTotal")) or float("inf"),
+            )[:detail]
+            for sol in sols_for_detail:
+                sid = sol.get("id")
+                if not sid:
+                    continue
+                try:
+                    d = client.detail(
+                        raw, sid,
+                        origin=origin, destination=destination,
+                        depart_date=depart, return_date=ret,
+                        cabin=cabin.upper(), adults=adults,
+                    )
+                    details_by_id[sid] = d.get("bookingDetails", {})
+                except Exception as e:
+                    details_by_id[sid] = {"error": str(e)}
 
     if output == "raw":
         print(json_module.dumps(raw, indent=2))
@@ -141,6 +194,8 @@ def search(
     sol_table.add_column("Out")
     sol_table.add_column("Return")
     sol_table.add_column("Duration")
+    if details_by_id:
+        sol_table.add_column("RBD")
 
     for sol in solutions[:top]:
         carriers = "/".join(c.code for c in sol.itinerary.carriers) or "?"
@@ -160,13 +215,10 @@ def search(
             else "—"
         )
         total_dur = sum(s.duration for s in slices)
-        sol_table.add_row(
-            sol.displayTotal,
-            carriers,
-            out_desc,
-            ret_desc,
-            _format_duration(total_dur),
-        )
+        cells = [sol.displayTotal, carriers, out_desc, ret_desc, _format_duration(total_dur)]
+        if details_by_id:
+            cells.append(_extract_rbd(details_by_id.get(sol.id)))
+        sol_table.add_row(*cells)
     console.print(sol_table)
     console.print(f"\n[dim]Returned {len(solutions)} solution(s) of {parsed.solutionCount} total.[/dim]")
 

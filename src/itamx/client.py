@@ -42,7 +42,9 @@ def _boundary() -> str:
     return f"batch{secrets.randbelow(10**19)}"
 
 
-def _multipart_request(inner_body: dict[str, Any], boundary: str) -> bytes:
+def _multipart_request(
+    inner_body: dict[str, Any], boundary: str, *, path: str = "/v1/search"
+) -> bytes:
     """Wrap a JSON-RPC call in the multipart/mixed batch envelope Matrix expects."""
     body_json = json.dumps(inner_body, separators=(",", ":"))
     parts = [
@@ -51,7 +53,7 @@ def _multipart_request(inner_body: dict[str, Any], boundary: str) -> bytes:
         "Content-Transfer-Encoding: binary",
         f"Content-ID: <{boundary}+gapiRequest@googleapis.com>",
         "",
-        f"POST /v1/search?key={API_KEY}&alt=json",
+        f"POST {path}?key={API_KEY}&alt=json",
         "x-alkali-application-key: applications/matrix",
         "x-alkali-auth-apps-namespace: alkali_v2",
         "x-alkali-auth-entities-namespace: alkali_v2",
@@ -166,6 +168,18 @@ class MatrixClient:
     def __exit__(self, *_: object) -> None:
         self._http.close()
 
+    def _post_batch(self, body: dict[str, Any], path: str) -> dict[str, Any]:
+        boundary = _boundary()
+        multipart = _multipart_request(body, boundary, path=path)
+        url = f"{BATCH_URL}?%24ct=multipart%2Fmixed%3B%20boundary%3D{boundary}"
+        resp = self._http.post(
+            url,
+            content=multipart,
+            headers={"Content-Type": "text/plain; charset=UTF-8"},
+        )
+        resp.raise_for_status()
+        return _parse_multipart_response(resp.content)
+
     def search(
         self,
         origin: str,
@@ -191,15 +205,66 @@ class MatrixClient:
             page_size=page_size,
             summarizers=summarizers,
         )
-        boundary = _boundary()
-        multipart = _multipart_request(body, boundary)
-        url = (
-            f"{BATCH_URL}?%24ct=multipart%2Fmixed%3B%20boundary%3D{boundary}"
-        )
-        resp = self._http.post(
-            url,
-            content=multipart,
-            headers={"Content-Type": "text/plain; charset=UTF-8"},
-        )
-        resp.raise_for_status()
-        return _parse_multipart_response(resp.content)
+        return self._post_batch(body, "/v1/search")
+
+    def detail(
+        self,
+        search_response: dict[str, Any],
+        solution_id: str,
+        *,
+        origin: str,
+        destination: str,
+        depart_date: str,
+        return_date: str | None = None,
+        adults: int = 1,
+        cabin: str = "COACH",
+    ) -> dict[str, Any]:
+        """Fetch booking details (incl. fare bookingCode) for one solution.
+
+        Pass the full search response dict and the per-solution `id`. The
+        session + solutionSet are pulled from the search response.
+        """
+        solution_set = search_response.get("solutionSet")
+        session = search_response.get("session")
+        if not solution_set or not session:
+            raise ValueError(
+                "search_response is missing solutionSet/session — was it a successful search?"
+            )
+
+        def slice_(o: str, d: str, date: str) -> dict[str, Any]:
+            return {
+                "origins": [o],
+                "destinations": [d],
+                "date": date,
+                "dateModifier": {"minus": 0, "plus": 0},
+                "isArrivalDate": False,
+                "filter": {"warnings": {"values": []}},
+                "selected": False,
+            }
+
+        slices = [slice_(origin, destination, depart_date)]
+        if return_date:
+            slices.append(slice_(destination, origin, return_date))
+
+        body = {
+            "summarizers": ["bookingDetails"],
+            "inputs": {
+                "filter": {},
+                "page": {"current": 1, "size": 25},
+                "pax": {"adults": adults},
+                "slices": slices,
+                "firstDayOfWeek": "SUNDAY",
+                "internalUser": False,
+                "sliceIndex": 0,
+                "sorts": "default",
+                "solution": f"{solution_set}/{solution_id}",
+                "cabin": cabin,
+                "maxLegsRelativeToMin": 1,
+                "changeOfAirport": True,
+                "checkAvailability": True,
+            },
+            "summarizerSet": "viewDetails",
+            "solutionSet": solution_set,
+            "session": session,
+        }
+        return self._post_batch(body, "/v1/summarize")

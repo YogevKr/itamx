@@ -45,6 +45,28 @@ def _boundary() -> str:
     return f"batch{secrets.randbelow(10**19)}"
 
 
+# Matrix's cabin enum uses a hyphen for Premium Economy ("PREMIUM-COACH") even
+# though the rest of the values (COACH, BUSINESS, FIRST) match the standard
+# Google/IATA underscore form. We accept both spellings from callers and
+# emit the wire form Matrix actually expects.
+_CABIN_WIRE = {
+    "COACH": "COACH",
+    "ECONOMY": "COACH",
+    "PREMIUM_COACH": "PREMIUM-COACH",
+    "PREMIUM-COACH": "PREMIUM-COACH",
+    "PREMIUM_ECONOMY": "PREMIUM-COACH",
+    "PREMIUM-ECONOMY": "PREMIUM-COACH",
+    "BUSINESS": "BUSINESS",
+    "FIRST": "FIRST",
+}
+
+
+def _normalize_cabin(cabin: str) -> str:
+    if not cabin:
+        return "COACH"
+    return _CABIN_WIRE.get(cabin.upper().strip(), cabin)
+
+
 def _multipart_request(
     inner_body: dict[str, Any], boundary: str, *, path: str = "/v1/search"
 ) -> bytes:
@@ -180,7 +202,9 @@ def build_search_body(
         "internalUser": False,
         "sliceIndex": 0,
         "sorts": sorts,
-        "cabin": cabin,
+        # Matrix uses 'PREMIUM-COACH' (hyphen) on the wire even though every
+        # other docs / UI form is 'PREMIUM_COACH'. Translate quietly.
+        "cabin": _normalize_cabin(cabin),
         "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,
         "changeOfAirport": change_of_airport,
         "checkAvailability": True,
@@ -355,7 +379,7 @@ class MatrixClient:
                 "sliceIndex": 0,
                 "sorts": sorts,
                 "solution": f"{solution_set}/{solution_id}",
-                "cabin": cabin,
+                "cabin": _normalize_cabin(cabin),
                 "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,
                 "changeOfAirport": change_of_airport,
                 "checkAvailability": True,

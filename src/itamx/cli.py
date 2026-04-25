@@ -735,7 +735,7 @@ def flex(
                 pe_by_flight.setdefault(f, []).append(dep)
         if pe_by_flight:
             console.print(
-                f"\n[bold]PE-equipped flights across the scan:[/bold]"
+                "\n[bold]PE-equipped flights across the scan:[/bold]"
             )
             for flt in sorted(pe_by_flight):
                 dates = pe_by_flight[flt]

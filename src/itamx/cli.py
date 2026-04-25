@@ -16,6 +16,7 @@ from rich.table import Table
 
 from itamx import airlines as airline_db
 from itamx.client import MatrixClient, Slice
+from itamx.client import _normalize_cabin as _client_normalize_cabin
 from itamx.models import SearchResponse
 from itamx.request_options import SearchOptions
 from itamx.render import extract_rbd, format_duration, format_time, price_float
@@ -73,6 +74,113 @@ def _validated(parser, *args):
         return parser(*args)
     except ValueError as exc:
         raise typer.BadParameter(str(exc))
+
+
+def _outbound_flights_unverified(resp: dict) -> set[str]:
+    """First flight # of EVERY slice across all solutions. Used as the Y baseline
+    (no verification needed: a Y search returns Y on long-haul).
+    """
+    flights: set[str] = set()
+    for sol in resp.get("solutionList", {}).get("solutions", []):
+        for sl in sol.get("itinerary", {}).get("slices", []):
+            if sl.get("flights"):
+                flights.add(sl["flights"][0])
+    return flights
+
+
+def _verify_cabin_long_haul(
+    client: MatrixClient,
+    base_resp: dict,
+    cabin: str,
+    slices_for_detail: list[Slice],
+    *,
+    pax=None,
+    max_unique_combos: int = 12,
+    max_workers: int = 4,
+) -> set[str]:
+    """Return long-haul flight numbers (across all slices) genuinely in `cabin`.
+
+    Matrix happily synthesizes itineraries that put a premium cabin only on
+    the connecting leg while the long-haul stays in COACH. We catch this by
+    fetching bookingDetails for the cheapest representative of each unique
+    outbound-flight combo and checking, slice by slice, that the FIRST
+    SEGMENT's bookingInfos.cabin matches what we asked for.
+
+    Grouping by outbound flight means we don't miss flights whose cabin price
+    is high (and thus would be ranked low in the response): e.g. LY 5 in
+    Business is much more expensive than LY 7, but we still want to verify
+    LY 5 specifically.
+
+    For COACH, verification is a no-op (the response itself is authoritative).
+    """
+    if cabin.upper() in ("COACH", "ECONOMY"):
+        return _outbound_flights_unverified(base_resp)
+
+    # Normalize to Matrix's wire form: e.g. PREMIUM_COACH → PREMIUM-COACH (with
+    # hyphen). The detail response carries the wire form back, so we compare
+    # against that.
+    target_wire = _client_normalize_cabin(cabin).upper()
+
+    # Pick the cheapest solution for each unique outbound first-flight #.
+    cheapest_per_flight: dict[str, dict] = {}
+    for sol in base_resp.get("solutionList", {}).get("solutions", []):
+        slcs = sol.get("itinerary", {}).get("slices", [])
+        if not slcs or not slcs[0].get("flights"):
+            continue
+        out_flt = slcs[0]["flights"][0]
+        cur = cheapest_per_flight.get(out_flt)
+        cur_p = price_float((cur or {}).get("displayTotal")) or float("inf")
+        new_p = price_float(sol.get("displayTotal")) or float("inf")
+        if new_p < cur_p:
+            cheapest_per_flight[out_flt] = sol
+
+    # Sort by price and cap to keep detail calls bounded.
+    representatives = sorted(
+        cheapest_per_flight.values(),
+        key=lambda s: price_float(s.get("displayTotal")) or float("inf"),
+    )[:max_unique_combos]
+
+    if not representatives:
+        return set()
+
+    def _verify(sol: dict) -> set[str]:
+        sid = sol.get("id")
+        if not sid:
+            return set()
+        try:
+            detail = client.detail(
+                base_resp, sid, slices_for_detail, cabin=cabin, pax=pax,
+            )
+        except Exception:
+            return set()
+        verified_flts: set[str] = set()
+        booking_slices = detail.get("bookingDetails", {}).get("itinerary", {}).get("slices", [])
+        for b_slice in booking_slices:
+            segs = b_slice.get("segments") or []
+            if not segs:
+                continue
+            # The long-haul segment is the longest-duration one in the slice.
+            # On a TLV-SFO RT, that's TLV→LAX outbound and JFK→TLV return.
+            long_haul = max(segs, key=lambda s: s.get("duration", 0))
+            cabins_in_lh = {
+                (bi.get("cabin") or "").upper()
+                for bi in long_haul.get("bookingInfos", [])
+            }
+            if target_wire not in cabins_in_lh:
+                continue
+            carrier = (long_haul.get("carrier") or {}).get("code")
+            num = (long_haul.get("flight") or {}).get("number")
+            if carrier and num is not None:
+                verified_flts.add(f"{carrier}{num}")
+        return verified_flts
+
+    verified: set[str] = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for fut in concurrent.futures.as_completed(
+            ex.submit(_verify, sol) for sol in representatives
+        ):
+            verified |= fut.result()
+    return verified
 
 
 @app.command("mcp-config")
@@ -291,41 +399,45 @@ def search(
 
         # Optional: probe W and J cabins in parallel and collect the set of
         # outbound flight numbers each cabin carries. Used to tag rows with
-        # cabin availability (catches things like "no PE cabin on the V.2 787").
+        # cabin availability. We verify per-segment cabin via bookingDetails
+        # so synthetic mixed-cabin itineraries (PE on the connection, Y on
+        # the long-haul) don't get falsely flagged.
         cabin_avail: dict[str, set[str]] = {"Y": set(), "W": set(), "J": set()}
         if scan_cabins:
             err_console.print(
-                "[dim]Scanning Premium Economy and Business cabins…[/dim]"
+                "[dim]Scanning Premium Economy and Business cabins (with cabin verification)…[/dim]"
             )
 
-            def _flights_in_response(resp: dict) -> set[str]:
-                flights: set[str] = set()
-                for sol in resp.get("solutionList", {}).get("solutions", []):
-                    for sl in sol.get("itinerary", {}).get("slices", []):
-                        # The first flight of a slice is the long-haul leg the
-                        # user cares about for cabin availability.
-                        for f in sl.get("flights", [])[:1]:
-                            flights.add(f)
-                return flights
-
-            cabin_avail["Y"] = _flights_in_response(raw)
+            cabin_avail["Y"] = _outbound_flights_unverified(raw)
+            # Use a large page_size for cabin probes — flights that are bookable
+            # in the cabin but priced steeply (e.g. LY 5 in J at the V.2 saver
+            # bucket) may sit outside the default top 50 results.
+            scan_kwargs = {**options.search_kwargs(), "page_size": 200}
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
                 futures = {
                     label: ex.submit(
                         client.search,
                         slices=slices,
                         pax=pax,
-                        **{**options.search_kwargs(), "cabin": cabin_code},
+                        **{**scan_kwargs, "cabin": cabin_code},
                     )
                     for label, cabin_code in (("W", "PREMIUM_COACH"), ("J", "BUSINESS"))
                 }
+                cabin_responses: dict[str, dict] = {}
                 for label, fut in futures.items():
                     try:
-                        cabin_avail[label] = _flights_in_response(fut.result())
+                        cabin_responses[label] = fut.result()
                     except Exception as e:
-                        err_console.print(
-                            f"[yellow]  {label} scan failed: {e}[/yellow]"
-                        )
+                        err_console.print(f"[yellow]  {label} scan failed: {e}[/yellow]")
+
+            # Verify each W/J response by per-segment detail check
+            for label, target_cabin in (("W", "PREMIUM_COACH"), ("J", "BUSINESS")):
+                resp_for_cabin = cabin_responses.get(label)
+                if resp_for_cabin is None:
+                    continue
+                cabin_avail[label] = _verify_cabin_long_haul(
+                    client, resp_for_cabin, target_cabin, slices, pax=pax,
+                )
 
         details_by_id: dict[str, dict] = {}
         if detail > 0:
@@ -466,16 +578,17 @@ def search(
             out_desc, ret_desc, format_duration(total_dur),
         ]
         if scan_cabins:
-            # Mark a cabin ✓ only if EVERY long-haul leg of this solution
-            # appears in that cabin's availability set. ✗ means at least one
-            # leg has no inventory in that cabin.
-            row_flights = [
-                sl.flights[0] for sl in slices_o if sl.flights
-            ]
+            # cabin_avail[X] contains long-haul flight numbers verified to have
+            # cabin X. Each slice has multiple flights; mark the slice ✓ if ANY
+            # of its flight numbers matches a verified long-haul (we don't know
+            # which segment is the long-haul from the search response alone,
+            # but the verified set only contains long-hauls so any-match works).
             tags = []
             for label in ("Y", "W", "J"):
                 avail = cabin_avail[label]
-                if all(f in avail for f in row_flights) and avail:
+                if avail and all(
+                    any(f in avail for f in sl.flights) for sl in slices_o if sl.flights
+                ):
                     tags.append(f"[green]{label}✓[/green]")
                 else:
                     tags.append(f"[red]{label}✗[/red]")
@@ -484,6 +597,21 @@ def search(
             cells.append(extract_rbd(details_by_id.get(sol.id)))
         sol_table.add_row(*cells)
     console.print(sol_table)
+
+    if scan_cabins:
+        # Surface the per-cabin verified long-haul flights so the user can see
+        # which legs carry which cabin even when no full row matches.
+        for label, name in (("W", "Premium Economy"), ("J", "Business")):
+            flights = sorted(cabin_avail.get(label, set()))
+            if flights:
+                console.print(
+                    f"[bold]{name} on long-haul:[/bold] {', '.join(flights)}"
+                )
+            else:
+                console.print(
+                    f"[bold]{name} on long-haul:[/bold] [red]none verified[/red]"
+                )
+
     console.print(
         f"\n[dim]Returned {len(solutions)} solution(s) of {parsed.solutionCount} total."
         + (f"  {len(details_by_id)} detail call(s) made." if details_by_id else "")
@@ -587,14 +715,6 @@ def flex(
     routing = _build_cli_routing(al_list, via)
     options = SearchOptions(cabin=cabin.upper(), max_stops=max_stops, page_size=20)
 
-    def _outbound_flights(resp: dict) -> set[str]:
-        flights: set[str] = set()
-        for s in resp.get("solutionList", {}).get("solutions", []):
-            slcs = s.get("itinerary", {}).get("slices", [])
-            if slcs and slcs[0].get("flights"):
-                flights.add(slcs[0]["flights"][0])
-        return flights
-
     def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, dict[str, set[str]] | None, str | None]:
         slices = build_trip_slices(
             origin=origin,
@@ -615,21 +735,36 @@ def flex(
                 )
                 cabin_avail: dict[str, set[str]] | None = None
                 if scan_cabins:
-                    cabin_avail = {"Y": _outbound_flights(resp), "W": set(), "J": set()}
+                    cabin_avail = {
+                        "Y": _outbound_flights_unverified(resp),
+                        "W": set(),
+                        "J": set(),
+                    }
+                    scan_kwargs = {**options.search_kwargs(), "page_size": 200}
                     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as inner:
                         futures = {
                             label: inner.submit(
                                 client.search,
                                 slices=slices,
-                                **{**options.search_kwargs(), "cabin": cabin_code},
+                                **{**scan_kwargs, "cabin": cabin_code},
                             )
                             for label, cabin_code in (("W", "PREMIUM_COACH"), ("J", "BUSINESS"))
                         }
+                        cabin_responses: dict[str, dict] = {}
                         for label, fut in futures.items():
                             try:
-                                cabin_avail[label] = _outbound_flights(fut.result())
+                                cabin_responses[label] = fut.result()
                             except Exception:
                                 pass
+                    # Verify each cabin's results via bookingDetails per-segment
+                    # cabin to filter out synthetic mixed-cabin itineraries.
+                    for label, target_cabin in (("W", "PREMIUM_COACH"), ("J", "BUSINESS")):
+                        resp_for_cabin = cabin_responses.get(label)
+                        if resp_for_cabin is None:
+                            continue
+                        cabin_avail[label] = _verify_cabin_long_haul(
+                            client, resp_for_cabin, target_cabin, slices,
+                        )
             return dep, ret, resp, cabin_avail, None
         except Exception as e:
             return dep, ret, None, None, str(e)

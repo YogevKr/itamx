@@ -424,7 +424,13 @@ wheels = [
 
 [[package]]
 name = "itamx"
+<<<<<<< HEAD
 version = "0.2.3"
+||||||| parent of 715698c (fix(scan-cabins): verify per-segment cabin to filter synthetic mixed itineraries)
+version = "0.2.2"
+=======
+version = "0.2.4"
+>>>>>>> 715698c (fix(scan-cabins): verify per-segment cabin to filter synthetic mixed itineraries)
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

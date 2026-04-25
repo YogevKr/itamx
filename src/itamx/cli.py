@@ -1121,6 +1121,14 @@ def show(
     list_only: Annotated[
         bool, typer.Option("--list", help="Just list solutions with their ranks")
     ] = False,
+    scan_cabins: Annotated[
+        bool,
+        typer.Option(
+            "--scan-cabins",
+            help="Probe Premium Economy and Business cabins in parallel and tag each "
+                 "segment with cabin availability + sub-fleet hint.",
+        ),
+    ] = False,
     output: Annotated[
         ShowOutput, typer.Option("--output", "-o", help="Output format")
     ] = ShowOutput.text,
@@ -1219,6 +1227,35 @@ def show(
             if output == ShowOutput.text:
                 console.print(f"[yellow]Detail fetch failed: {e}[/yellow]")
             booking = None
+
+        # Optional: probe W and J cabins so we can annotate each segment with
+        # which cabins are bookable on that long-haul flight.
+        flight_cabins: dict[str, set[str]] = {}
+        if scan_cabins:
+            scan_kwargs = {**options.search_kwargs(), "page_size": 200}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as inner:
+                cabin_futures = {
+                    label: inner.submit(
+                        client.search,
+                        slices=slices,
+                        **{**scan_kwargs, "cabin": cabin_code},
+                    )
+                    for label, cabin_code in (("W", "PREMIUM_COACH"), ("J", "BUSINESS"))
+                }
+                cabin_resps: dict[str, dict] = {}
+                for label, fut in cabin_futures.items():
+                    try:
+                        cabin_resps[label] = fut.result()
+                    except Exception:
+                        pass
+            for label, target_cabin in (("W", "PREMIUM_COACH"), ("J", "BUSINESS")):
+                resp = cabin_resps.get(label)
+                if resp is None:
+                    continue
+                per_slice = _verify_cabin_long_haul(client, resp, target_cabin, slices)
+                for flts in per_slice.values():
+                    for flt in flts:
+                        flight_cabins.setdefault(flt, set()).add(label)
 
     # JSON / raw output: emit and return before rendering text
     if output == ShowOutput.raw:
@@ -1337,11 +1374,28 @@ def show(
                     console.print(f"   [dim]layover at {seg_o}: {format_duration(layover)}[/dim]")
                 except Exception:
                     pass
+            cabin_tag = ""
+            fleet_hint = ""
+            if scan_cabins:
+                flt_key = f"{carrier}{flt_num}"
+                cabins_here = flight_cabins.get(flt_key, set())
+                marks = []
+                marks.append("[green]Y✓[/green]")  # Y always works for a Y-priced search
+                marks.append("[green]W✓[/green]" if "W" in cabins_here else "[red]W✗[/red]")
+                marks.append("[green]J✓[/green]" if "J" in cabins_here else "[red]J✗[/red]")
+                cabin_tag = "  " + " ".join(marks)
+                # Sub-fleet hint specifically for LY 787-9 rotations (V.1 vs V.2)
+                if carrier == "LY" and "787" in (aircraft or ""):
+                    if "W" in cabins_here:
+                        fleet_hint = "  [dim](787-9 V.1 — has PE)[/dim]"
+                    elif "J" in cabins_here:
+                        fleet_hint = "  [dim](787-9 V.2 — no PE)[/dim]"
             console.print(
                 f"   {carrier} {flt_num:<5}  {seg_o}→{seg_d}  "
                 f"{format_time(seg_dep)} → {format_time(seg_arr)}  "
                 f"[{format_duration(seg_dur)}]  "
                 f"{cabin_classes} ({booking_codes})  •  {aircraft}"
+                f"{cabin_tag}{fleet_hint}"
             )
             prev_arr = seg_arr
         console.print()

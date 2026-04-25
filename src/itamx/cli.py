@@ -6,7 +6,6 @@ import concurrent.futures
 import csv as csv_module
 import datetime as dt
 import json as json_module
-import re
 import sys
 from typing import Annotated
 
@@ -17,6 +16,17 @@ from rich.table import Table
 from itamx import airlines as airline_db
 from itamx.client import MatrixClient, PaxCount, Slice
 from itamx.models import SearchResponse
+from itamx.request_options import SearchOptions
+from itamx.render import extract_rbd, format_duration, format_time, price_float
+from itamx.validation import (
+    SearchOutput,
+    ShowOutput,
+    SortOrder,
+    TableOutput,
+    parse_int_range,
+    parse_time_ranges,
+    parse_weekdays,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -24,74 +34,6 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
-
-
-_PRICE_RE = re.compile(r"^([A-Z]{3})([\d.]+)$")
-
-
-def _price_float(s: str | None) -> float | None:
-    if not s:
-        return None
-    m = _PRICE_RE.match(s)
-    if m:
-        return float(m.group(2))
-    return None
-
-
-def _format_duration(minutes: int) -> str:
-    h, m = divmod(minutes, 60)
-    return f"{h}h{m:02d}m"
-
-
-def _format_time(iso_ts: str) -> str:
-    """Trim ISO timestamp to 'MM-DD HH:MM'."""
-    if "T" not in iso_ts:
-        return iso_ts
-    date, time = iso_ts.split("T", 1)
-    return f"{date[5:]} {time[:5]}"
-
-
-def _extract_rbd(booking_details: dict | None) -> str:
-    """Format RBD letters per slice from a bookingDetails response."""
-    if not booking_details:
-        return "—"
-    if "error" in booking_details:
-        return "err"
-    out_parts: list[str] = []
-    for slice_ in booking_details.get("itinerary", {}).get("slices", []):
-        codes = []
-        for seg in slice_.get("segments", []):
-            for bi in seg.get("bookingInfos", []):
-                code = bi.get("bookingCode")
-                if code:
-                    codes.append(code)
-        out_parts.append("/".join(codes) if codes else "?")
-    return " | ".join(out_parts) if out_parts else "—"
-
-
-def _parse_time_ranges(spec: str | None) -> list[tuple[str, str]]:
-    """Parse time-window spec like '6-20' or '0-6,18-23' into (HH:MM,HH:MM) pairs."""
-    if not spec:
-        return []
-    out: list[tuple[str, str]] = []
-    for chunk in spec.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if "-" not in chunk:
-            raise typer.BadParameter(f"Time range must be HH-HH (got {chunk!r})")
-        a, b = chunk.split("-", 1)
-        out.append((_to_hhmm(a), _to_hhmm(b)))
-    return out
-
-
-def _to_hhmm(s: str) -> str:
-    s = s.strip()
-    if ":" in s:
-        return s
-    if s.isdigit():
-        return f"{int(s):02d}:00"
-    raise typer.BadParameter(f"Bad time {s!r}; expected HH or HH:MM")
 
 
 def _rbd_command(rbds: list[str] | None) -> str | None:
@@ -166,6 +108,13 @@ def _build_routing(
 def _combine_commands(*cmds: str | None) -> str | None:
     parts = [c for c in cmds if c]
     return " ".join(parts) if parts else None
+
+
+def _validated(parser, *args):
+    try:
+        return parser(*args)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
 
 
 @app.command()
@@ -265,8 +214,8 @@ def search(
         int, typer.Option("--limit", help="Max solutions to return", min=1, max=500)
     ] = 50,
     output: Annotated[
-        str, typer.Option("--output", "-o", help="text | json | csv | raw")
-    ] = "text",
+        SearchOutput, typer.Option("--output", "-o", help="Output format")
+    ] = SearchOutput.text,
     top: Annotated[int, typer.Option("--top", help="Rows to show in text mode")] = 15,
     detail: Annotated[
         int,
@@ -288,12 +237,9 @@ def search(
         ),
     ] = None,
     sort: Annotated[
-        str,
-        typer.Option(
-            "--sort",
-            help="Sort order: default | price | duration | departureTime | arrivalTime",
-        ),
-    ] = "default",
+        SortOrder,
+        typer.Option("--sort", help="Sort order to request from Matrix"),
+    ] = SortOrder.default,
     max_duration: Annotated[
         int | None,
         typer.Option(
@@ -327,7 +273,7 @@ def search(
         flex_minus=flex, flex_plus=flex,
         route_language=out_routing_final,
         command_line=out_cmd_final,
-        time_ranges=_parse_time_ranges(out_time),
+        time_ranges=_validated(parse_time_ranges, out_time),
     )
     slices = [out_slice]
     if ret:
@@ -336,7 +282,7 @@ def search(
             flex_minus=flex, flex_plus=flex,
             route_language=ret_routing_final,
             command_line=ret_cmd_final,
-            time_ranges=_parse_time_ranges(ret_time),
+            time_ranges=_validated(parse_time_ranges, ret_time),
         )
         slices.append(ret_slice)
 
@@ -344,18 +290,21 @@ def search(
         adults=adults, seniors=seniors, youths=youths, children=children,
         infants_in_seat=infants_seat, infants_in_lap=infants_lap,
     )
+    options = SearchOptions(
+        cabin=cabin.upper(),
+        max_stops=max_stops,
+        page_size=page_size,
+        sorts=sort.value,
+        currency=currency,
+        sales_city=sales_city,
+    )
 
     with MatrixClient() as client:
         try:
             raw = client.search(
                 slices=slices,
                 pax=pax,
-                cabin=cabin.upper(),
-                max_stops=max_stops,
-                page_size=page_size,
-                currency=currency,
-                sales_city=sales_city,
-                sorts=sort,
+                **options.search_kwargs(),
             )
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
@@ -365,26 +314,32 @@ def search(
         if detail > 0:
             sols_for_detail = sorted(
                 raw.get("solutionList", {}).get("solutions", []),
-                key=lambda s: _price_float(s.get("displayTotal")) or float("inf"),
+                key=lambda s: price_float(s.get("displayTotal")) or float("inf"),
             )[:detail]
             for sol in sols_for_detail:
                 sid = sol.get("id")
                 if not sid:
                     continue
                 try:
-                    d = client.detail(raw, sid, slices, pax=pax, cabin=cabin.upper())
+                    d = client.detail(
+                        raw,
+                        sid,
+                        slices,
+                        pax=pax,
+                        **options.detail_kwargs(),
+                    )
                     details_by_id[sid] = d.get("bookingDetails", {})
                 except Exception as e:
                     details_by_id[sid] = {"error": str(e)}
 
-    if output == "raw":
+    if output == SearchOutput.raw:
         print(json_module.dumps(raw, indent=2))
         return
 
     parsed = SearchResponse.model_validate(raw)
     solutions = sorted(
         parsed.solutionList.solutions,
-        key=lambda s: _price_float(s.displayTotal) or float("inf"),
+        key=lambda s: price_float(s.displayTotal) or float("inf"),
     )
 
     if max_duration is not None:
@@ -394,7 +349,7 @@ def search(
             if sum(sl.duration for sl in s.itinerary.slices) <= max_min
         ]
 
-    if output == "json":
+    if output == SearchOutput.json:
         # Strip down to the most useful structured fields
         out = {
             "solutions": [s.model_dump(mode="json") for s in solutions],
@@ -405,7 +360,7 @@ def search(
         print(json_module.dumps(out, indent=2, default=str))
         return
 
-    if output == "csv":
+    if output == SearchOutput.csv:
         writer = csv_module.writer(sys.stdout)
         header = ["price", "carriers", "out_dep", "out_route", "out_flights", "out_dur_min",
                   "ret_dep", "ret_route", "ret_flights", "ret_dur_min", "total_dur_min"]
@@ -430,7 +385,7 @@ def search(
                 sum(s.duration for s in slices_o),
             ]
             if details_by_id:
-                row.append(_extract_rbd(details_by_id.get(sol.id)))
+                row.append(extract_rbd(details_by_id.get(sol.id)))
             writer.writerow(row)
         return
 
@@ -475,8 +430,8 @@ def search(
         def _slice_desc(s):
             stops = max(0, len(s.flights) - 1)
             return (
-                f"{_format_time(s.departure)} {s.origin.code}→{s.destination.code} "
-                f"({'/'.join(s.flights)}, {_format_duration(s.duration)}"
+                f"{format_time(s.departure)} {s.origin.code}→{s.destination.code} "
+                f"({'/'.join(s.flights)}, {format_duration(s.duration)}"
                 + (f", {stops} stop{'s' if stops != 1 else ''})" if stops else ", nonstop)")
             )
 
@@ -489,10 +444,10 @@ def search(
         total_dur = sum(s.duration for s in slices_o)
         cells = [
             sol.displayTotal, carriers, stops_str,
-            out_desc, ret_desc, _format_duration(total_dur),
+            out_desc, ret_desc, format_duration(total_dur),
         ]
         if details_by_id:
-            cells.append(_extract_rbd(details_by_id.get(sol.id)))
+            cells.append(extract_rbd(details_by_id.get(sol.id)))
         sol_table.add_row(*cells)
     console.print(sol_table)
     console.print(
@@ -500,14 +455,6 @@ def search(
         + (f"  {len(details_by_id)} detail call(s) made." if details_by_id else "")
         + "[/dim]"
     )
-
-
-def _parse_int_range(spec: str) -> list[int]:
-    """Parse '5' → [5] or '5-8' → [5,6,7,8] for use in --stay etc."""
-    if "-" in spec:
-        a, b = spec.split("-", 1)
-        return list(range(int(a), int(b) + 1))
-    return [int(spec)]
 
 
 @app.command()
@@ -543,7 +490,9 @@ def flex(
     parallel: Annotated[
         int, typer.Option("--parallel", "-p", help="Concurrent searches", min=1, max=8)
     ] = 3,
-    output: Annotated[str, typer.Option("--output", "-o", help="text | json | csv")] = "text",
+    output: Annotated[
+        TableOutput, typer.Option("--output", "-o", help="Output format")
+    ] = TableOutput.text,
 ) -> None:
     """Find the cheapest week in a date range. One Matrix search per candidate departure date.
 
@@ -558,19 +507,11 @@ def flex(
     if d_end < d_start:
         raise typer.BadParameter("end is before start")
 
-    weekday_filter: set[int] | None = None
-    if days.strip():
-        name_to_idx = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
-        weekday_filter = {
-            name_to_idx[d.strip().upper()] for d in days.split(",") if d.strip()
-        }
+    weekday_filter = _validated(parse_weekdays, days)
 
     # Determine trip lengths to try
     if stay:
-        try:
-            durations_to_try = _parse_int_range(stay)
-        except ValueError:
-            raise typer.BadParameter(f"--stay must be 'N' or 'N-M' (got {stay!r})")
+        durations_to_try = _validated(parse_int_range, stay)
     else:
         durations_to_try = [duration]
 
@@ -582,6 +523,8 @@ def flex(
             cur += dt.timedelta(days=1)
             continue
         for dur_days in durations_to_try:
+            if dur_days > 0 and cur + dt.timedelta(days=dur_days) > d_end:
+                continue
             ret_date = (
                 (cur + dt.timedelta(days=dur_days)).isoformat() if dur_days > 0 else None
             )
@@ -600,24 +543,26 @@ def flex(
 
     al_list = [a for a in airlines.split(",")] if airlines else None
     routing = _build_routing(al_list, via)
+    options = SearchOptions(cabin=cabin.upper(), max_stops=max_stops, page_size=20)
 
     def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, str | None]:
         out_slice = Slice(
             origin=origin.upper(), destination=destination.upper(), date=dep,
             route_language=routing,
-            time_ranges=_parse_time_ranges(out_time),
+            time_ranges=_validated(parse_time_ranges, out_time),
         )
         slices = [out_slice]
         if ret:
             slices.append(Slice(
                 origin=destination.upper(), destination=origin.upper(), date=ret,
                 route_language=routing,
-                time_ranges=_parse_time_ranges(ret_time),
+                time_ranges=_validated(parse_time_ranges, ret_time),
             ))
         try:
             with MatrixClient() as client:
                 resp = client.search(
-                    slices=slices, cabin=cabin.upper(), max_stops=max_stops, page_size=20
+                    slices=slices,
+                    **options.search_kwargs(),
                 )
             return dep, ret, resp, None
         except Exception as e:
@@ -633,14 +578,14 @@ def flex(
             if not sols:
                 rows.append((dep, ret, None, "—", None))
                 continue
-            cheapest = min(sols, key=lambda s: _price_float(s.get("displayTotal")) or float("inf"))
-            price = _price_float(cheapest.get("displayTotal"))
+            cheapest = min(sols, key=lambda s: price_float(s.get("displayTotal")) or float("inf"))
+            price = price_float(cheapest.get("displayTotal"))
             carriers = "/".join(c.get("code", "?") for c in cheapest.get("itinerary", {}).get("carriers", []))
             rows.append((dep, ret, price, cheapest.get("displayTotal"), carriers))
 
     rows.sort(key=lambda r: (r[2] is None, r[2] or float("inf")))
 
-    if output == "json":
+    if output == TableOutput.json:
         print(json_module.dumps([
             {
                 "depart": dep, "return": ret,
@@ -651,7 +596,7 @@ def flex(
         ], indent=2))
         return
 
-    if output == "csv":
+    if output == TableOutput.csv:
         writer = csv_module.writer(sys.stdout)
         writer.writerow(["depart", "return", "day", "price", "display_price", "carriers"])
         for dep, ret, price, disp, car in rows:
@@ -665,7 +610,7 @@ def flex(
     )
     table = Table(title=f"Cheapest week  {origin.upper()} ↔ {destination.upper()}  ({dur_label})")
     table.add_column("Depart")
-    table.add_column("Return" if duration > 0 else "")
+    table.add_column("Return" if any(ret for _, ret, *_ in rows) else "")
     table.add_column("Day")
     table.add_column("Price", justify="right")
     table.add_column("Carriers")
@@ -679,7 +624,9 @@ def flex(
 def lookup(
     query: Annotated[str, typer.Argument(help="Partial city or airport name or IATA code")],
     limit: Annotated[int, typer.Option("--limit", min=1, max=50)] = 10,
-    output: Annotated[str, typer.Option("--output", "-o", help="text | json | csv")] = "text",
+    output: Annotated[
+        TableOutput, typer.Option("--output", "-o", help="Output format")
+    ] = TableOutput.text,
 ) -> None:
     """Resolve city/airport names. Useful when you don't know the IATA code."""
     with MatrixClient() as client:
@@ -689,11 +636,11 @@ def lookup(
             console.print(f"[red]Lookup failed: {e}[/red]")
             raise typer.Exit(1)
 
-    if output == "json":
+    if output == TableOutput.json:
         print(json_module.dumps(locations, indent=2))
         return
 
-    if output == "csv":
+    if output == TableOutput.csv:
         writer = csv_module.writer(sys.stdout)
         writer.writerow(["code", "type", "name", "city", "city_code"])
         for loc in locations:
@@ -742,7 +689,9 @@ def multi(
     sales_city: Annotated[str | None, typer.Option("--sales-city")] = None,
     detail: Annotated[int, typer.Option("--detail", "-d", min=0, max=20)] = 0,
     top: Annotated[int, typer.Option("--top")] = 10,
-    output: Annotated[str, typer.Option("--output", "-o", help="text | json | csv | raw")] = "text",
+    output: Annotated[
+        SearchOutput, typer.Option("--output", "-o", help="Output format")
+    ] = SearchOutput.text,
 ) -> None:
     """Multi-city / open-jaw search. Pass `--leg SOURCE:DESTINATION:DATE` 2+ times.
 
@@ -765,12 +714,19 @@ def multi(
         ))
 
     pax = PaxCount(adults=adults)
+    options = SearchOptions(
+        cabin=cabin.upper(),
+        max_stops=max_stops,
+        page_size=50,
+        currency=currency,
+        sales_city=sales_city,
+    )
     with MatrixClient() as client:
         try:
             raw = client.search(
-                slices=slices, pax=pax, cabin=cabin.upper(),
-                max_stops=max_stops, page_size=50,
-                currency=currency, sales_city=sales_city,
+                slices=slices,
+                pax=pax,
+                **options.search_kwargs(),
             )
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
@@ -780,33 +736,39 @@ def multi(
         if detail > 0:
             sols = sorted(
                 raw.get("solutionList", {}).get("solutions", []),
-                key=lambda s: _price_float(s.get("displayTotal")) or float("inf"),
+                key=lambda s: price_float(s.get("displayTotal")) or float("inf"),
             )[:detail]
             for sol in sols:
                 sid = sol.get("id")
                 if not sid:
                     continue
                 try:
-                    d = client.detail(raw, sid, slices, pax=pax, cabin=cabin.upper())
+                    d = client.detail(
+                        raw,
+                        sid,
+                        slices,
+                        pax=pax,
+                        **options.detail_kwargs(),
+                    )
                     details_by_id[sid] = d.get("bookingDetails", {})
                 except Exception as e:
                     details_by_id[sid] = {"error": str(e)}
 
-    if output == "raw":
+    if output == SearchOutput.raw:
         print(json_module.dumps(raw, indent=2))
         return
 
     parsed = SearchResponse.model_validate(raw)
     sols = sorted(
         parsed.solutionList.solutions,
-        key=lambda s: _price_float(s.displayTotal) or float("inf"),
+        key=lambda s: price_float(s.displayTotal) or float("inf"),
     )
 
-    if output == "json":
+    if output == SearchOutput.json:
         print(json_module.dumps([s.model_dump(mode="json") for s in sols], indent=2, default=str))
         return
 
-    if output == "csv":
+    if output == SearchOutput.csv:
         writer = csv_module.writer(sys.stdout)
         leg_cols = []
         for i in range(len(slices)):
@@ -829,7 +791,7 @@ def multi(
                 row.append("")
             row.append(sum(s.duration for s in sol.itinerary.slices))
             if details_by_id:
-                row.append(_extract_rbd(details_by_id.get(sol.id)))
+                row.append(extract_rbd(details_by_id.get(sol.id)))
             writer.writerow(row)
         return
 
@@ -850,15 +812,15 @@ def multi(
         cells = [sol.displayTotal, "/".join(c.code for c in sol.itinerary.carriers)]
         for s in sol.itinerary.slices:
             cells.append(
-                f"{_format_time(s.departure)} {s.origin.code}→{s.destination.code} "
-                f"({'/'.join(s.flights)}, {_format_duration(s.duration)})"
+                f"{format_time(s.departure)} {s.origin.code}→{s.destination.code} "
+                f"({'/'.join(s.flights)}, {format_duration(s.duration)})"
             )
         # Pad if Matrix returned fewer slices than we asked
         while len(cells) - 2 < len(slices):
             cells.append("?")
-        cells.append(_format_duration(sum(s.duration for s in sol.itinerary.slices)))
+        cells.append(format_duration(sum(s.duration for s in sol.itinerary.slices)))
         if details_by_id:
-            cells.append(_extract_rbd(details_by_id.get(sol.id)))
+            cells.append(extract_rbd(details_by_id.get(sol.id)))
         table.add_row(*cells)
     console.print(table)
 
@@ -886,8 +848,8 @@ def show(
         bool, typer.Option("--list", help="Just list solutions with their ranks")
     ] = False,
     output: Annotated[
-        str, typer.Option("--output", "-o", help="text | json | raw")
-    ] = "text",
+        ShowOutput, typer.Option("--output", "-o", help="Output format")
+    ] = ShowOutput.text,
 ) -> None:
     """Show full segment-by-segment detail for one solution: aircraft, layovers, RBD.
 
@@ -898,26 +860,27 @@ def show(
     out_slice = Slice(
         origin=origin, destination=destination, date=depart,
         route_language=routing,
-        time_ranges=_parse_time_ranges(out_time),
+        time_ranges=_validated(parse_time_ranges, out_time),
     )
     slices = [out_slice]
     if ret:
         slices.append(Slice(
             origin=destination, destination=origin, date=ret,
             route_language=routing,
-            time_ranges=_parse_time_ranges(ret_time),
+            time_ranges=_validated(parse_time_ranges, ret_time),
         ))
+    options = SearchOptions(cabin=cabin.upper(), page_size=50)
 
     with MatrixClient() as client:
         try:
-            raw = client.search(slices=slices, cabin=cabin.upper(), page_size=50)
+            raw = client.search(slices=slices, **options.search_kwargs())
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
             raise typer.Exit(1)
 
         sols = sorted(
             raw.get("solutionList", {}).get("solutions", []),
-            key=lambda s: _price_float(s.get("displayTotal")) or float("inf"),
+            key=lambda s: price_float(s.get("displayTotal")) or float("inf"),
         )
         if not sols:
             console.print("[yellow]No solutions returned[/yellow]")
@@ -945,8 +908,11 @@ def show(
                     ],
                 })
 
-            if output == "json":
+            if output == ShowOutput.json:
                 print(json_module.dumps(ranked, indent=2))
+                return
+            if output == ShowOutput.raw:
+                print(json_module.dumps(raw, indent=2))
                 return
 
             tbl = Table(title="Available solutions")
@@ -975,18 +941,18 @@ def show(
         target = sols[rank - 1]
         sid = target.get("id")
         try:
-            d = client.detail(raw, sid, slices, cabin=cabin.upper())
+            d = client.detail(raw, sid, slices, **options.detail_kwargs())
             booking = d.get("bookingDetails", {})
         except Exception as e:
-            if output == "text":
+            if output == ShowOutput.text:
                 console.print(f"[yellow]Detail fetch failed: {e}[/yellow]")
             booking = None
 
     # JSON / raw output: emit and return before rendering text
-    if output == "raw":
+    if output == ShowOutput.raw:
         print(json_module.dumps({"search": raw, "detail": booking}, indent=2))
         return
-    if output == "json":
+    if output == ShowOutput.json:
         out = {
             "rank": rank,
             "displayTotal": target.get("displayTotal"),
@@ -1066,7 +1032,7 @@ def show(
                 dur = target_slices[i - 1].get("duration", 0)
         console.print(
             f"[bold]Leg {i}[/bold]  {origin_code} → {dest_code}  "
-            f"{_format_time(dep)} → {_format_time(arr)}  ({_format_duration(dur)})"
+            f"{format_time(dep)} → {format_time(arr)}  ({format_duration(dur)})"
         )
 
         segs = sl.get("segments", [])
@@ -1093,15 +1059,16 @@ def show(
             if prev_arr:
                 from datetime import datetime as _dt
                 try:
-                    a = _dt.fromisoformat(prev_arr); b = _dt.fromisoformat(seg_dep)
+                    a = _dt.fromisoformat(prev_arr)
+                    b = _dt.fromisoformat(seg_dep)
                     layover = int((b - a).total_seconds() / 60)
-                    console.print(f"   [dim]layover at {seg_o}: {_format_duration(layover)}[/dim]")
+                    console.print(f"   [dim]layover at {seg_o}: {format_duration(layover)}[/dim]")
                 except Exception:
                     pass
             console.print(
                 f"   {carrier} {flt_num:<5}  {seg_o}→{seg_d}  "
-                f"{_format_time(seg_dep)} → {_format_time(seg_arr)}  "
-                f"[{_format_duration(seg_dur)}]  "
+                f"{format_time(seg_dep)} → {format_time(seg_arr)}  "
+                f"[{format_duration(seg_dur)}]  "
                 f"{cabin_classes} ({booking_codes})  •  {aircraft}"
             )
             prev_arr = seg_arr
@@ -1119,8 +1086,8 @@ def airlines_cmd(
     ] = None,
     limit: Annotated[int, typer.Option("--limit", min=1, max=2000)] = 50,
     output: Annotated[
-        str, typer.Option("--output", "-o", help="text | json | csv")
-    ] = "text",
+        TableOutput, typer.Option("--output", "-o", help="Output format")
+    ] = TableOutput.text,
 ) -> None:
     """Look up airline IATA codes by name (or vice versa).
 
@@ -1136,11 +1103,11 @@ def airlines_cmd(
     else:
         results = list(airline_db.all_airlines().values())[:limit]
 
-    if output == "json":
+    if output == TableOutput.json:
         print(json_module.dumps(results, indent=2, ensure_ascii=False))
         return
 
-    if output == "csv":
+    if output == TableOutput.csv:
         writer = csv_module.writer(sys.stdout)
         writer.writerow(["iata", "icao", "name", "callsign", "country"])
         for a in results:

@@ -12,6 +12,7 @@ import json
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -286,9 +287,10 @@ class MatrixClient:
 
         Returns a list of dicts with code, displayName, type, cityCode, latLng.
         """
+        encoded_name = quote(partial_name, safe="")
         path = (
             f"/v1/locationTypes/CITIES_AND_AIRPORTS/partialNames/"
-            f"{partial_name}/locations?pageSize={page_size}"
+            f"{encoded_name}/locations?pageSize={page_size}"
         )
         return self._get_batch(path).get("locations", [])
 
@@ -329,6 +331,11 @@ class MatrixClient:
         *,
         pax: PaxCount | None = None,
         cabin: str = "COACH",
+        max_stops: int | None = None,
+        sorts: str = "default",
+        change_of_airport: bool = True,
+        currency: str | None = None,
+        sales_city: str | None = None,
     ) -> dict[str, Any]:
         """Fetch booking details (incl. fare bookingCode) for one solution."""
         solution_set = search_response.get("solutionSet")
@@ -346,15 +353,19 @@ class MatrixClient:
                 "firstDayOfWeek": "SUNDAY",
                 "internalUser": False,
                 "sliceIndex": 0,
-                "sorts": "default",
+                "sorts": sorts,
                 "solution": f"{solution_set}/{solution_id}",
                 "cabin": cabin,
-                "maxLegsRelativeToMin": 1,
-                "changeOfAirport": True,
+                "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,
+                "changeOfAirport": change_of_airport,
                 "checkAvailability": True,
             },
             "summarizerSet": "viewDetails",
             "solutionSet": solution_set,
             "session": session,
         }
+        if currency:
+            body["inputs"]["currency"] = currency
+        if sales_city:
+            body["inputs"]["salesCity"] = sales_city
         return self._post_batch(body, "/v1/summarize")

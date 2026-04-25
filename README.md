@@ -91,9 +91,8 @@ itamx lookup "CODE" -o json
 
 ```bash
 itamx airlines "Airline Name"    # resolve a carrier name
-itamx airlines "partial name"    # returns matching carriers
 itamx airlines AIRLINE           # resolve an IATA code
-
+itamx airlines "partial name"    # returns matching carriers
 itamx airlines --output csv      # full ~986-row mapping
 ```
 
@@ -158,7 +157,7 @@ The complete public surface:
 | Symbol | Purpose |
 |---|---|
 | `itamx.client.MatrixClient` | The HTTPS client. Methods: `search()`, `detail()`, `lookup_locations()` |
-| `itamx.client.Slice` | Trip leg dataclass — origin/destination/date + filters |
+| `itamx.client.Slice` | Trip leg dataclass — source/destination/date + filters |
 | `itamx.client.PaxCount` | Passenger breakdown |
 | `itamx.client.build_search_body` | Compose a search payload without sending it (for inspection / replay) |
 | `itamx.airlines.search(query)` | Substring search, returns ranked list of airline dicts |

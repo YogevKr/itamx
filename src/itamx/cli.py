@@ -80,9 +80,8 @@ def _build_routing(
 
     Examples:
         --airlines AIRLINE              -> "AIRLINE+"
-        --via TRANSIT                  -> "TRANSIT"
-        --airlines AIRLINE --via TRANSIT    -> "AIRLINE TRANSIT AIRLINE"  (force that airline through that transit point)
-        --airlines AIRLINE1,AIRLINE2           -> "(AIRLINE1|AIRLINE2)+"
+        --via TRANSIT                   -> "TRANSIT"
+        --airlines AIRLINE --via TRANSIT -> "AIRLINE TRANSIT AIRLINE"
     """
     al_codes = _resolve_airlines(airlines)
     suffix = "+" if strict_airline else ""
@@ -696,7 +695,7 @@ def multi(
     """Multi-city / open-jaw search. Pass `--leg SOURCE:DESTINATION:DATE` 2+ times.
 
     Example:
-        itamx multi -l SOURCE:STOPOVER:LEG1_DATE -l STOPOVER:DESTINATION:LEG2_DATE -l DESTINATION:SOURCE:LEG3_DATE
+        itamx multi -l SOURCE:STOPOVER:LEG1_DATE -l STOPOVER:DESTINATION:LEG2_DATE
     """
     if len(leg) < 2:
         raise typer.BadParameter("Need at least 2 legs (use --leg multiple times)")
@@ -1095,7 +1094,6 @@ def airlines_cmd(
         itamx airlines "Airline Name"
         itamx airlines AIRLINE
         itamx airlines "partial name"
-        
         itamx airlines --output csv     # full mapping
     """
     if query:

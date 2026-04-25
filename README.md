@@ -49,8 +49,12 @@ itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --detail 5
 # Raw routing / commandLine for advanced QPX-style queries
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --out-routing "AIRLINE+ TRANSIT" --out-cmd "f bc=B|H"
 
+# Currency / point-of-sale (affects which fares are offered)
+itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --currency CURRENCY --sales-city SALES_CITY
+
 # Machine-readable
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output json | jq '.solutions[0]'
+itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output csv > prices.csv
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output raw    # full API response
 ```
 
@@ -65,6 +69,23 @@ itamx flex SOURCE DESTINATION START_DATE END_DATE \
 
 Each candidate departure date is searched in parallel (default 3 concurrent;
 `--parallel N` to tune). Output is a price-ranked table.
+
+### `itamx multi` — multi-city / open-jaw
+
+```bash
+# Three legs: source → stopover → destination → source
+itamx multi \
+    --leg SOURCE:STOPOVER:LEG1_DATE \
+    --leg STOPOVER:DESTINATION:LEG2_DATE \
+    --leg DESTINATION:SOURCE:LEG3_DATE
+```
+
+### `itamx lookup` — airport / city autocomplete
+
+```bash
+itamx lookup "Tel"          # find IATA codes matching a partial name
+itamx lookup "CODE" -o json
+```
 
 ## How it works
 
@@ -94,10 +115,10 @@ the QPX engine):
 
 ## Known limits
 
-- No airport autocomplete (use IATA codes).
-- Multi-city / open-jaw not yet exposed.
 - Matrix rate limits are undocumented; if Google starts requiring the
   `bgProgramResponse` (WAA) token, we'll need to add token handling.
+- Time windows that wrap midnight (e.g. 22:00–02:00) need to be expressed as
+  two ranges (`--out-time 22-23,0-2`).
 
 ## Re-capturing the API spec
 

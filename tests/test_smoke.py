@@ -54,6 +54,25 @@ def test_search_flight_filter_match(fake_matrix):
     assert "LY5" in result.output
 
 
+def test_search_aircraft_filter_match(fake_matrix):
+    # Fixture detail has a Boeing 787 segment, so substring "787" matches
+    result = runner.invoke(
+        app,
+        ["search", "TLV", "SFO", "2026-05-18", "2026-05-24", "--aircraft", "787"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "USD500.00" in result.output
+
+
+def test_search_aircraft_filter_excludes(fake_matrix):
+    result = runner.invoke(
+        app,
+        ["search", "TLV", "SFO", "2026-05-18", "2026-05-24", "--aircraft", "A350"],
+    )
+    assert result.exit_code == 0
+    assert "No solutions" in result.output
+
+
 def test_search_flight_filter_excludes(fake_matrix):
     result = runner.invoke(
         app,

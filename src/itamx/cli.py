@@ -89,6 +89,7 @@ def _diagnose_empty_search(
     out_cmd: str | None,
     out_time: str | None,
     flight: str | None,
+    aircraft: str | None = None,
 ) -> list[str]:
     """Return a list of human-readable hints for why a search returned 0 results.
 
@@ -136,6 +137,11 @@ def _diagnose_empty_search(
         likely.append(
             f"--flight {flight}: the requested flight # may not operate, "
             "or may be priced out of Matrix's top results"
+        )
+    if aircraft:
+        likely.append(
+            f"--aircraft {aircraft}: no segment in the top results uses a "
+            "matching aircraft type"
         )
     if out_routing:
         likely.append(
@@ -423,6 +429,15 @@ def search(
                  "(comma-separated, e.g. LY5 or LY5,LY10). Post-filter, AND across the list.",
         ),
     ] = None,
+    aircraft: Annotated[
+        str | None,
+        typer.Option(
+            "--aircraft",
+            help="Restrict results to itineraries that use any of these aircraft "
+                 "(comma-separated substrings, case-insensitive — e.g. '787-9' or "
+                 "'787,A350'). Triggers detail lookups on top results.",
+        ),
+    ] = None,
 ) -> None:
     """Search flights. Returns a price-sorted table with optional fare-class detail.
 
@@ -527,11 +542,17 @@ def search(
                 )
 
         details_by_id: dict[str, dict] = {}
-        if detail > 0:
+        # Aircraft filter requires segment-level data, only available via
+        # bookingDetails. Bump the detail fetch count to cover top results
+        # even when the user didn't pass --detail explicitly.
+        effective_detail = detail
+        if aircraft:
+            effective_detail = max(effective_detail, 30)
+        if effective_detail > 0:
             sols_for_detail = sorted(
                 raw.get("solutionList", {}).get("solutions", []),
                 key=lambda s: price_float(s.get("displayTotal")) or float("inf"),
-            )[:detail]
+            )[:effective_detail]
             for sol in sols_for_detail:
                 sid = sol.get("id")
                 if not sid:
@@ -576,6 +597,49 @@ def search(
             err_console.print(
                 f"[yellow]No solutions contain all of {sorted(wanted)} (post-filter).[/yellow]"
             )
+
+    # --aircraft filter: keep solutions where any segment uses an aircraft
+    # whose shortName contains any of the comma-separated patterns. Needs
+    # bookingDetails; we already bumped the detail fetch count above.
+    if aircraft:
+        patterns = [p.strip().lower() for p in aircraft.split(",") if p.strip()]
+        if not patterns:
+            pass
+        else:
+            def _aircraft_in(sol_id: str) -> set[str]:
+                bd = details_by_id.get(sol_id) or {}
+                if "error" in bd:
+                    return set()
+                names: set[str] = set()
+                for sl in bd.get("itinerary", {}).get("slices", []):
+                    for seg in sl.get("segments", []):
+                        for leg in seg.get("legs", []):
+                            ac = (leg.get("aircraft") or {}).get("shortName")
+                            if ac:
+                                names.add(ac.lower())
+                return names
+
+            kept = []
+            unfetched = 0
+            for s in solutions:
+                if s.id not in details_by_id:
+                    unfetched += 1
+                    continue
+                acs = _aircraft_in(s.id)
+                if any(p in ac for ac in acs for p in patterns):
+                    kept.append(s)
+            solutions = kept
+            if unfetched:
+                err_console.print(
+                    f"[dim]aircraft: {unfetched} solution(s) skipped (no detail fetched; "
+                    f"raise --detail or top to widen).[/dim]"
+                )
+            if not solutions:
+                err_console.print(
+                    f"[yellow]No solutions used aircraft matching {patterns}. "
+                    f"Aircraft seen across fetched details: "
+                    f"{sorted({a for sid in details_by_id for a in _aircraft_in(sid)})}[/yellow]"
+                )
 
     if output == SearchOutput.json:
         # Strip down to the most useful structured fields
@@ -644,6 +708,7 @@ def search(
                 depart=depart, ret=ret, cabin=cabin,
                 max_stops=max_stops, out_routing=out_routing_final,
                 out_cmd=out_cmd_final, out_time=out_time, flight=flight,
+                aircraft=aircraft,
             ):
                 console.print(f"[dim]  {h}[/dim]")
         return

@@ -161,9 +161,15 @@ LOCATIONS_RESPONSE = {
 
 @pytest.fixture(autouse=True)
 def isolated_cache(tmp_path, monkeypatch):
-    """Point the disk cache at a tempdir per test, with cache disabled by default."""
+    """Per-test isolation: tempdir cache (off by default) + fake API key."""
     monkeypatch.setenv("ITAMX_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("ITAMX_NO_CACHE", "1")
+    # Provide a syntactically-valid fake key so keyfetch never tries the live
+    # fetch during tests. Matches the AIza<35> regex.
+    monkeypatch.setenv("ITAMX_API_KEY", "AIzaTestTestTestTestTestTestTestTest000")
+    # Reset any in-process cache from prior tests
+    from itamx import keyfetch
+    keyfetch.reset_cache()
     yield
 
 

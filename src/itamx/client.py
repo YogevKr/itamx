@@ -16,7 +16,8 @@ from urllib.parse import quote
 
 import httpx
 
-API_KEY = "AIza<redacted-public-key>"
+from itamx.keyfetch import get_api_key
+
 BATCH_URL = "https://content-alkalimatrix-pa.googleapis.com/batch"
 ORIGIN = "https://matrix.itasoftware.com"
 
@@ -78,7 +79,7 @@ def _multipart_request(
         "Content-Transfer-Encoding: binary",
         f"Content-ID: <{boundary}+gapiRequest@googleapis.com>",
         "",
-        f"POST {path}?key={API_KEY}&alt=json",
+        f"POST {path}?key={get_api_key()}&alt=json",
         "x-alkali-application-key: applications/matrix",
         "x-alkali-auth-apps-namespace: alkali_v2",
         "x-alkali-auth-entities-namespace: alkali_v2",
@@ -346,7 +347,11 @@ class MatrixClient:
             "Content-Transfer-Encoding: binary",
             f"Content-ID: <{boundary}+gapiRequest@googleapis.com>",
             "",
-            f"GET {path}&key={API_KEY}" if "?" in path else f"GET {path}?key={API_KEY}",
+            (
+                f"GET {path}&key={get_api_key()}"
+                if "?" in path
+                else f"GET {path}?key={get_api_key()}"
+            ),
             "x-alkali-application-key: applications/matrix",
             "x-alkali-auth-apps-namespace: alkali_v2",
             "x-alkali-auth-entities-namespace: alkali_v2",

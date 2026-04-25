@@ -240,3 +240,22 @@ def test_client_normalize_cabin():
     assert _normalize_cabin("PREMIUM_ECONOMY") == "PREMIUM-COACH"
     assert _normalize_cabin("BUSINESS") == "BUSINESS"
     assert _normalize_cabin("COACH") == "COACH"
+
+
+def test_keyfetch_env_var(monkeypatch):
+    from itamx import keyfetch
+
+    monkeypatch.setenv("ITAMX_API_KEY", "AIzaABCDEFGHIJKLMNOPQRSTUVWXYZ012345678")
+    keyfetch.reset_cache()
+    assert keyfetch.get_api_key() == "AIzaABCDEFGHIJKLMNOPQRSTUVWXYZ012345678"
+
+
+def test_keyfetch_rejects_malformed(monkeypatch):
+    from itamx import keyfetch
+
+    monkeypatch.setenv("ITAMX_API_KEY", "not-a-real-key")
+    keyfetch.reset_cache()
+    # Falls through env (rejected as malformed) → cache (empty) → live (offline)
+    # → fallback. We just verify it returns something matching the AIza pattern.
+    import re
+    assert re.fullmatch(r"AIza[0-9A-Za-z_-]{35}", keyfetch.get_api_key())

@@ -136,7 +136,9 @@ class RegressionTests(unittest.TestCase):
         result = runner.invoke(app, ["search", "TLV", "SFO", "2026-05-18", "--sort", "bogus"])
 
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("Invalid value for '--sort'", result.output)
+        self.assertIn("Invalid value", result.output)
+        self.assertIn("sort", result.output)
+        self.assertIn("bogus", result.output)
 
     def test_flex_does_not_allow_return_past_end_date(self) -> None:
         result = runner.invoke(

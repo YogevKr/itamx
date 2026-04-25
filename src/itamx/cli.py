@@ -520,7 +520,7 @@ def flex(
     parallel: Annotated[
         int, typer.Option("--parallel", "-p", help="Concurrent searches", min=1, max=8)
     ] = 3,
-    output: Annotated[str, typer.Option("--output", "-o")] = "text",
+    output: Annotated[str, typer.Option("--output", "-o", help="text | json | csv")] = "text",
 ) -> None:
     """Find the cheapest week in a date range. One Matrix search per candidate departure date.
 
@@ -569,7 +569,9 @@ def flex(
         console.print("[yellow]No candidate dates after filtering[/yellow]")
         raise typer.Exit(1)
 
-    console.print(
+    # Route progress to stderr so JSON/CSV output to stdout stays clean for piping.
+    err_console = Console(stderr=True)
+    err_console.print(
         f"[dim]Searching {len(candidates)} (depart, return) combinations…[/dim]"
     )
 
@@ -617,9 +619,21 @@ def flex(
 
     if output == "json":
         print(json_module.dumps([
-            {"depart": dep, "return": ret, "cheapest": disp, "carriers": car}
-            for dep, ret, _, disp, car in rows
+            {
+                "depart": dep, "return": ret,
+                "day": dt.date.fromisoformat(dep).strftime("%A"),
+                "price": price, "displayPrice": disp, "carriers": car,
+            }
+            for dep, ret, price, disp, car in rows
         ], indent=2))
+        return
+
+    if output == "csv":
+        writer = csv_module.writer(sys.stdout)
+        writer.writerow(["depart", "return", "day", "price", "display_price", "carriers"])
+        for dep, ret, price, disp, car in rows:
+            wkday = dt.date.fromisoformat(dep).strftime("%a")
+            writer.writerow([dep, ret or "", wkday, price or "", disp or "", car or ""])
         return
 
     dur_label = (
@@ -642,7 +656,7 @@ def flex(
 def lookup(
     query: Annotated[str, typer.Argument(help="Partial city or airport name or IATA code")],
     limit: Annotated[int, typer.Option("--limit", min=1, max=50)] = 10,
-    output: Annotated[str, typer.Option("--output", "-o")] = "text",
+    output: Annotated[str, typer.Option("--output", "-o", help="text | json | csv")] = "text",
 ) -> None:
     """Resolve city/airport names. Useful when you don't know the IATA code."""
     with MatrixClient() as client:
@@ -654,6 +668,19 @@ def lookup(
 
     if output == "json":
         print(json_module.dumps(locations, indent=2))
+        return
+
+    if output == "csv":
+        writer = csv_module.writer(sys.stdout)
+        writer.writerow(["code", "type", "name", "city", "city_code"])
+        for loc in locations:
+            writer.writerow([
+                loc.get("code", ""),
+                loc.get("type", ""),
+                loc.get("displayName", ""),
+                loc.get("cityName", ""),
+                loc.get("cityCode", ""),
+            ])
         return
 
     if not locations:
@@ -692,7 +719,7 @@ def multi(
     sales_city: Annotated[str | None, typer.Option("--sales-city")] = None,
     detail: Annotated[int, typer.Option("--detail", "-d", min=0, max=20)] = 0,
     top: Annotated[int, typer.Option("--top")] = 10,
-    output: Annotated[str, typer.Option("--output", "-o")] = "text",
+    output: Annotated[str, typer.Option("--output", "-o", help="text | json | csv | raw")] = "text",
 ) -> None:
     """Multi-city / open-jaw search. Pass `--leg SOURCE:DESTINATION:DATE` 2+ times.
 
@@ -756,6 +783,33 @@ def multi(
         print(json_module.dumps([s.model_dump(mode="json") for s in sols], indent=2, default=str))
         return
 
+    if output == "csv":
+        writer = csv_module.writer(sys.stdout)
+        leg_cols = []
+        for i in range(len(slices)):
+            leg_cols += [f"leg{i+1}_dep", f"leg{i+1}_route", f"leg{i+1}_flights", f"leg{i+1}_dur_min"]
+        header = ["price", "carriers"] + leg_cols + ["total_dur_min"]
+        if details_by_id:
+            header.append("rbd")
+        writer.writerow(header)
+        for sol in sols[:top]:
+            row = [sol.displayTotal, "/".join(c.code for c in sol.itinerary.carriers)]
+            for s in sol.itinerary.slices:
+                row += [
+                    s.departure,
+                    f"{s.origin.code}->{s.destination.code}",
+                    "/".join(s.flights),
+                    s.duration,
+                ]
+            # pad if Matrix returned fewer slices than requested
+            while len(row) - 2 < len(slices) * 4:
+                row.append("")
+            row.append(sum(s.duration for s in sol.itinerary.slices))
+            if details_by_id:
+                row.append(_extract_rbd(details_by_id.get(sol.id)))
+            writer.writerow(row)
+        return
+
     if not sols:
         console.print("[yellow]No solutions returned[/yellow]")
         return
@@ -808,6 +862,9 @@ def show(
     list_only: Annotated[
         bool, typer.Option("--list", help="Just list solutions with their ranks")
     ] = False,
+    output: Annotated[
+        str, typer.Option("--output", "-o", help="text | json | raw")
+    ] = "text",
 ) -> None:
     """Show full segment-by-segment detail for one solution: aircraft, layovers, RBD.
 
@@ -844,21 +901,45 @@ def show(
             raise typer.Exit(0)
 
         if list_only:
+            ranked = []
+            for i, s in enumerate(sols[:30], 1):
+                slcs = s.get("itinerary", {}).get("slices", [])
+                ranked.append({
+                    "rank": i,
+                    "id": s.get("id"),
+                    "displayTotal": s.get("displayTotal"),
+                    "carriers": [c.get("code") for c in s.get("itinerary", {}).get("carriers", [])],
+                    "slices": [
+                        {
+                            "origin": sl["origin"]["code"],
+                            "destination": sl["destination"]["code"],
+                            "departure": sl.get("departure"),
+                            "arrival": sl.get("arrival"),
+                            "flights": sl.get("flights", []),
+                            "duration": sl.get("duration"),
+                        }
+                        for sl in slcs
+                    ],
+                })
+
+            if output == "json":
+                print(json_module.dumps(ranked, indent=2))
+                return
+
             tbl = Table(title="Available solutions")
             tbl.add_column("Rank")
             tbl.add_column("Price", justify="right")
             tbl.add_column("Carriers")
             tbl.add_column("Itinerary")
-            for i, s in enumerate(sols[:30], 1):
-                slcs = s.get("itinerary", {}).get("slices", [])
+            for r in ranked:
                 summary = " / ".join(
-                    f"{sl['origin']['code']}→{sl['destination']['code']} {'/'.join(sl.get('flights', []))}"
-                    for sl in slcs
+                    f"{sl['origin']}→{sl['destination']} {'/'.join(sl['flights'])}"
+                    for sl in r["slices"]
                 )
                 tbl.add_row(
-                    str(i),
-                    s.get("displayTotal", "?"),
-                    "/".join(c.get("code", "?") for c in s.get("itinerary", {}).get("carriers", [])),
+                    str(r["rank"]),
+                    r.get("displayTotal", "?"),
+                    "/".join(r["carriers"]),
                     summary,
                 )
             console.print(tbl)
@@ -874,8 +955,60 @@ def show(
             d = client.detail(raw, sid, slices, cabin=cabin.upper())
             booking = d.get("bookingDetails", {})
         except Exception as e:
-            console.print(f"[yellow]Detail fetch failed: {e}[/yellow]")
+            if output == "text":
+                console.print(f"[yellow]Detail fetch failed: {e}[/yellow]")
             booking = None
+
+    # JSON / raw output: emit and return before rendering text
+    if output == "raw":
+        print(json_module.dumps({"search": raw, "detail": booking}, indent=2))
+        return
+    if output == "json":
+        out = {
+            "rank": rank,
+            "displayTotal": target.get("displayTotal"),
+            "carriers": [c.get("code") for c in target.get("itinerary", {}).get("carriers", [])],
+            "distance": target.get("itinerary", {}).get("distance"),
+            "ext": target.get("ext"),
+            "slices": [],
+        }
+        booking_slices = (booking or {}).get("itinerary", {}).get("slices", [])
+        target_slices = target.get("itinerary", {}).get("slices", [])
+        iter_slices = booking_slices or target_slices
+        for i, sl in enumerate(iter_slices):
+            seg_data = []
+            for seg in sl.get("segments", []):
+                aircraft = None
+                for leg in seg.get("legs", []):
+                    if leg.get("aircraft", {}).get("shortName"):
+                        aircraft = leg["aircraft"]["shortName"]
+                        break
+                seg_data.append({
+                    "carrier": seg.get("carrier", {}).get("code"),
+                    "flight": seg.get("flight", {}).get("number"),
+                    "origin": seg.get("origin", {}).get("code"),
+                    "destination": seg.get("destination", {}).get("code"),
+                    "departure": seg.get("departure"),
+                    "arrival": seg.get("arrival"),
+                    "duration": seg.get("duration"),
+                    "bookingCodes": [bi.get("bookingCode") for bi in seg.get("bookingInfos", [])],
+                    "cabins": list(set(bi.get("cabin") for bi in seg.get("bookingInfos", []))),
+                    "aircraft": aircraft,
+                })
+            slice_dur = sl.get("duration") or sum(s.get("duration", 0) for s in sl.get("segments", []))
+            if not slice_dur and i < len(target_slices):
+                slice_dur = target_slices[i].get("duration")
+            out["slices"].append({
+                "origin": sl.get("origin", {}).get("code"),
+                "destination": sl.get("destination", {}).get("code"),
+                "departure": sl.get("departure"),
+                "arrival": sl.get("arrival"),
+                "duration": slice_dur,
+                "stopCount": sl.get("stopCount"),
+                "segments": seg_data,
+            })
+        print(json_module.dumps(out, indent=2, default=str))
+        return
 
     # Render — header
     console.print(

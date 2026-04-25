@@ -87,6 +87,86 @@ itamx lookup "Tel"          # find IATA codes matching a partial name
 itamx lookup "CODE" -o json
 ```
 
+### `itamx airlines` — IATA ↔ name lookup
+
+```bash
+itamx airlines "Airline Name"    # resolve a carrier name
+itamx airlines "partial name"    # returns matching carriers
+itamx airlines AIRLINE           # resolve an IATA code
+
+itamx airlines --output csv      # full ~986-row mapping
+```
+
+The same resolver is plumbed into `--airlines` on `search` / `flex` / `multi` / `show`,
+so any of these accept either IATA codes or names:
+
+```bash
+itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --airlines "Airline Name"
+itamx flex SOURCE DESTINATION START_DATE END_DATE --airlines "Airline Name" --days SUN
+```
+
+## Calling itamx from agents / scripts
+
+### Subprocess (any language)
+
+Every command supports machine-readable output (`-o json` or `-o csv`).
+Status text goes to stderr, so stdout stays a clean parse target:
+
+```bash
+itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE -o json | jq '.solutions[0].displayTotal'
+```
+
+Exit codes: `0` on success, `1` on search failure or no matches.
+
+### Python library
+
+`itamx` is also importable directly — no subprocess needed:
+
+```python
+from itamx.client import MatrixClient, Slice, PaxCount
+from itamx.airlines import resolve, search as airline_search
+
+# Round-trip source → destination through a transit point, with date flex
+slices = [
+    Slice(origin="SOURCE", destination="DESTINATION", date="DEPART_DATE",
+          route_language="AIRLINE TRANSIT AIRLINE"),
+    Slice(origin="DESTINATION", destination="SOURCE", date="RETURN_DATE",
+          route_language="AIRLINE TRANSIT AIRLINE"),
+]
+
+with MatrixClient() as client:
+    resp = client.search(slices=slices, cabin="COACH", max_stops=1)
+    cheapest = min(
+        resp["solutionList"]["solutions"],
+        key=lambda s: float(s["displayTotal"][3:]),
+    )
+    print(cheapest["displayTotal"], cheapest["id"])
+
+    # Drill into fare-class detail
+    detail = client.detail(resp, cheapest["id"], slices, cabin="COACH")
+    for sl in detail["bookingDetails"]["itinerary"]["slices"]:
+        for seg in sl["segments"]:
+            print(seg["carrier"]["code"], seg["flight"]["number"],
+                  seg["bookingInfos"][0]["bookingCode"])
+
+# Resolve an airline name to its IATA code
+print(resolve("Airline Name"))
+```
+
+The complete public surface:
+
+| Symbol | Purpose |
+|---|---|
+| `itamx.client.MatrixClient` | The HTTPS client. Methods: `search()`, `detail()`, `lookup_locations()` |
+| `itamx.client.Slice` | Trip leg dataclass — origin/destination/date + filters |
+| `itamx.client.PaxCount` | Passenger breakdown |
+| `itamx.client.build_search_body` | Compose a search payload without sending it (for inspection / replay) |
+| `itamx.airlines.search(query)` | Substring search, returns ranked list of airline dicts |
+| `itamx.airlines.resolve(token)` | Best-effort IATA resolver, returns code or `None` if ambiguous |
+| `itamx.airlines.by_iata(code)` | Direct lookup |
+| `itamx.airlines.all_airlines()` | The full `~986`-entry table |
+| `itamx.models.SearchResponse` | Pydantic model for search response (extra fields preserved) |
+
 ## How it works
 
 Matrix's web app is a Google "Alkali" mini-app. Search is a single POST to

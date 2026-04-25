@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from itamx import airlines as airline_db
 from itamx.client import MatrixClient, PaxCount, Slice
 from itamx.models import SearchResponse
 
@@ -103,6 +104,30 @@ def _rbd_command(rbds: list[str] | None) -> str | None:
     return f"f bc={'|'.join(codes)}"
 
 
+def _resolve_airlines(tokens: list[str] | None) -> list[str]:
+    """Map a list of free-form tokens (IATA codes or partial names) to IATA codes.
+
+    Tokens that don't resolve cleanly (ambiguous or unknown) keep their original
+    upper-cased form — Matrix will treat them as raw IATA.
+    Logs unresolved tokens to stderr so the user knows.
+    """
+    out: list[str] = []
+    err = Console(stderr=True)
+    for raw in tokens or []:
+        t = raw.strip()
+        if not t:
+            continue
+        resolved = airline_db.resolve(t)
+        if resolved:
+            out.append(resolved)
+            if resolved != t.upper():
+                err.print(f"[dim]  {t!r} → {resolved} ({airline_db.by_iata(resolved)['name']})[/dim]")
+        else:
+            err.print(f"[yellow]  {t!r}: no unique airline match — passing through as-is[/yellow]")
+            out.append(t.upper())
+    return out
+
+
 def _build_routing(
     airlines: list[str] | None,
     via: str | None,
@@ -117,8 +142,7 @@ def _build_routing(
         --airlines AIRLINE --via TRANSIT    -> "AIRLINE TRANSIT AIRLINE"  (force that airline through that transit point)
         --airlines AIRLINE1,AIRLINE2           -> "(AIRLINE1|AIRLINE2)+"
     """
-    parts: list[str] = []
-    al_codes = [a.strip().upper() for a in (airlines or []) if a.strip()]
+    al_codes = _resolve_airlines(airlines)
     suffix = "+" if strict_airline else ""
     airline_token = None
     if al_codes:
@@ -131,7 +155,6 @@ def _build_routing(
     via_token = via.strip().upper() if via else None
 
     if airline_token and via_token:
-        # Force airline through the via airport (both segments)
         return f"{airline_token} {via_token} {airline_token}"
     if airline_token:
         return airline_token
@@ -1083,6 +1106,68 @@ def show(
             )
             prev_arr = seg_arr
         console.print()
+
+
+@app.command(name="airlines")
+def airlines_cmd(
+    query: Annotated[
+        str | None,
+        typer.Argument(
+            help="Search term (IATA code, ICAO, name substring, country, callsign). "
+                 "Omit to dump the full table.",
+        ),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=2000)] = 50,
+    output: Annotated[
+        str, typer.Option("--output", "-o", help="text | json | csv")
+    ] = "text",
+) -> None:
+    """Look up airline IATA codes by name (or vice versa).
+
+    Examples:
+        itamx airlines "Airline Name"
+        itamx airlines AIRLINE
+        itamx airlines "partial name"
+        
+        itamx airlines --output csv     # full mapping
+    """
+    if query:
+        results = airline_db.search(query, limit=limit)
+    else:
+        results = list(airline_db.all_airlines().values())[:limit]
+
+    if output == "json":
+        print(json_module.dumps(results, indent=2, ensure_ascii=False))
+        return
+
+    if output == "csv":
+        writer = csv_module.writer(sys.stdout)
+        writer.writerow(["iata", "icao", "name", "callsign", "country"])
+        for a in results:
+            writer.writerow([
+                a.get("iata", ""), a.get("icao") or "", a.get("name", ""),
+                a.get("callsign") or "", a.get("country") or "",
+            ])
+        return
+
+    if not results:
+        console.print(f"[yellow]No airlines matched {query!r}[/yellow]")
+        return
+
+    title = f"Airlines matching {query!r}" if query else f"Airlines (first {len(results)})"
+    table = Table(title=title)
+    table.add_column("IATA")
+    table.add_column("ICAO")
+    table.add_column("Name")
+    table.add_column("Country")
+    for a in results:
+        table.add_row(
+            a.get("iata", ""),
+            a.get("icao") or "—",
+            a.get("name", ""),
+            a.get("country") or "—",
+        )
+    console.print(table)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 [project]
 name = "itamx"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI for ITA Matrix airfare search (reverse-engineered JSON API)"
 readme = "README.md"
 authors = [

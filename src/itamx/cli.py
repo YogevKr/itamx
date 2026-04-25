@@ -76,16 +76,15 @@ def _validated(parser, *args):
         raise typer.BadParameter(str(exc))
 
 
-def _outbound_flights_unverified(resp: dict) -> set[str]:
-    """First flight # of EVERY slice across all solutions. Used as the Y baseline
-    (no verification needed: a Y search returns Y on long-haul).
+def _outbound_flights_unverified(resp: dict) -> dict[int, set[str]]:
+    """All flight #s seen, indexed by slice position. Y baseline (no
+    verification needed: a Y search returns Y on every leg).
     """
-    flights: set[str] = set()
+    by_slice: dict[int, set[str]] = {}
     for sol in resp.get("solutionList", {}).get("solutions", []):
-        for sl in sol.get("itinerary", {}).get("slices", []):
-            if sl.get("flights"):
-                flights.add(sl["flights"][0])
-    return flights
+        for i, sl in enumerate(sol.get("itinerary", {}).get("slices", [])):
+            by_slice.setdefault(i, set()).update(sl.get("flights") or [])
+    return by_slice
 
 
 def _verify_cabin_long_haul(
@@ -97,7 +96,7 @@ def _verify_cabin_long_haul(
     pax=None,
     max_unique_combos: int = 12,
     max_workers: int = 4,
-) -> set[str]:
+) -> dict[int, set[str]]:
     """Return long-haul flight numbers (across all slices) genuinely in `cabin`.
 
     Matrix happily synthesizes itineraries that put a premium cabin only on
@@ -115,6 +114,8 @@ def _verify_cabin_long_haul(
     """
     if cabin.upper() in ("COACH", "ECONOMY"):
         return _outbound_flights_unverified(base_resp)
+
+    # Per-slice verified flight numbers (index → set of long-haul flight #s).
 
     # Normalize to Matrix's wire form: e.g. PREMIUM_COACH → PREMIUM-COACH (with
     # hyphen). The detail response carries the wire form back, so we compare
@@ -141,26 +142,25 @@ def _verify_cabin_long_haul(
     )[:max_unique_combos]
 
     if not representatives:
-        return set()
+        return {}
 
-    def _verify(sol: dict) -> set[str]:
+    def _verify(sol: dict) -> dict[int, set[str]]:
         sid = sol.get("id")
         if not sid:
-            return set()
+            return {}
         try:
             detail = client.detail(
                 base_resp, sid, slices_for_detail, cabin=cabin, pax=pax,
             )
         except Exception:
-            return set()
-        verified_flts: set[str] = set()
+            return {}
+        per_slice: dict[int, set[str]] = {}
         booking_slices = detail.get("bookingDetails", {}).get("itinerary", {}).get("slices", [])
-        for b_slice in booking_slices:
+        for i, b_slice in enumerate(booking_slices):
             segs = b_slice.get("segments") or []
             if not segs:
                 continue
-            # The long-haul segment is the longest-duration one in the slice.
-            # On a TLV-SFO RT, that's TLV→LAX outbound and JFK→TLV return.
+            # Long-haul = longest-duration segment in the slice.
             long_haul = max(segs, key=lambda s: s.get("duration", 0))
             cabins_in_lh = {
                 (bi.get("cabin") or "").upper()
@@ -171,15 +171,16 @@ def _verify_cabin_long_haul(
             carrier = (long_haul.get("carrier") or {}).get("code")
             num = (long_haul.get("flight") or {}).get("number")
             if carrier and num is not None:
-                verified_flts.add(f"{carrier}{num}")
-        return verified_flts
+                per_slice.setdefault(i, set()).add(f"{carrier}{num}")
+        return per_slice
 
-    verified: set[str] = set()
+    verified: dict[int, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         for fut in concurrent.futures.as_completed(
             ex.submit(_verify, sol) for sol in representatives
         ):
-            verified |= fut.result()
+            for i, flts in fut.result().items():
+                verified.setdefault(i, set()).update(flts)
     return verified
 
 
@@ -398,11 +399,10 @@ def search(
             raise typer.Exit(1)
 
         # Optional: probe W and J cabins in parallel and collect the set of
-        # outbound flight numbers each cabin carries. Used to tag rows with
-        # cabin availability. We verify per-segment cabin via bookingDetails
-        # so synthetic mixed-cabin itineraries (PE on the connection, Y on
-        # the long-haul) don't get falsely flagged.
-        cabin_avail: dict[str, set[str]] = {"Y": set(), "W": set(), "J": set()}
+        # long-haul flight numbers each cabin carries, indexed by slice
+        # position so we can tag per-direction. Verification via bookingDetails
+        # filters out synthetic mixed-cabin itineraries.
+        cabin_avail: dict[str, dict[int, set[str]]] = {"Y": {}, "W": {}, "J": {}}
         if scan_cabins:
             err_console.print(
                 "[dim]Scanning Premium Economy and Business cabins (with cabin verification)…[/dim]"
@@ -578,20 +578,19 @@ def search(
             out_desc, ret_desc, format_duration(total_dur),
         ]
         if scan_cabins:
-            # cabin_avail[X] contains long-haul flight numbers verified to have
-            # cabin X. Each slice has multiple flights; mark the slice ✓ if ANY
-            # of its flight numbers matches a verified long-haul (we don't know
-            # which segment is the long-haul from the search response alone,
-            # but the verified set only contains long-hauls so any-match works).
+            # cabin_avail[X][i] holds verified long-haul flights for cabin X
+            # in slice index i. Tag per-direction: ✓ if any flight in that
+            # slice matches the verified set for that slice index.
+            #   Y✓✓ W✗✓ J✓✗  reads as "Y both legs, W only return, J only out"
             tags = []
             for label in ("Y", "W", "J"):
-                avail = cabin_avail[label]
-                if avail and all(
-                    any(f in avail for f in sl.flights) for sl in slices_o if sl.flights
-                ):
-                    tags.append(f"[green]{label}✓[/green]")
-                else:
-                    tags.append(f"[red]{label}✗[/red]")
+                per_slice = cabin_avail[label]
+                marks = []
+                for i, sl in enumerate(slices_o):
+                    avail = per_slice.get(i, set())
+                    has = bool(avail) and bool(sl.flights) and any(f in avail for f in sl.flights)
+                    marks.append("[green]✓[/green]" if has else "[red]✗[/red]")
+                tags.append(f"{label}{''.join(marks)}")
             cells.append(" ".join(tags))
         if details_by_id:
             cells.append(extract_rbd(details_by_id.get(sol.id)))
@@ -599,18 +598,22 @@ def search(
     console.print(sol_table)
 
     if scan_cabins:
-        # Surface the per-cabin verified long-haul flights so the user can see
-        # which legs carry which cabin even when no full row matches.
+        # Surface the per-cabin verified long-haul flights split by direction
+        # (outbound = slice 0, return = slice 1+) so the user can see which
+        # legs carry which cabin even when no full row matches.
+        directions = ["outbound", "return", "leg 3", "leg 4"]
         for label, name in (("W", "Premium Economy"), ("J", "Business")):
-            flights = sorted(cabin_avail.get(label, set()))
-            if flights:
-                console.print(
-                    f"[bold]{name} on long-haul:[/bold] {', '.join(flights)}"
-                )
-            else:
-                console.print(
-                    f"[bold]{name} on long-haul:[/bold] [red]none verified[/red]"
-                )
+            per_slice = cabin_avail.get(label, {})
+            flat: set[str] = set().union(*per_slice.values()) if per_slice else set()
+            if not flat:
+                console.print(f"[bold]{name} on long-haul:[/bold] [red]none verified[/red]")
+                continue
+            parts = []
+            for i in sorted(per_slice):
+                flts = sorted(per_slice[i])
+                d = directions[i] if i < len(directions) else f"leg {i+1}"
+                parts.append(f"{d}: {', '.join(flts)}")
+            console.print(f"[bold]{name} on long-haul[/bold] — " + " | ".join(parts))
 
     console.print(
         f"\n[dim]Returned {len(solutions)} solution(s) of {parsed.solutionCount} total."
@@ -715,7 +718,7 @@ def flex(
     routing = _build_cli_routing(al_list, via)
     options = SearchOptions(cabin=cabin.upper(), max_stops=max_stops, page_size=20)
 
-    def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, dict[str, set[str]] | None, str | None]:
+    def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, dict[str, dict[int, set[str]]] | None, str | None]:
         slices = build_trip_slices(
             origin=origin,
             destination=destination,
@@ -737,8 +740,8 @@ def flex(
                 if scan_cabins:
                     cabin_avail = {
                         "Y": _outbound_flights_unverified(resp),
-                        "W": set(),
-                        "J": set(),
+                        "W": {},
+                        "J": {},
                     }
                     scan_kwargs = {**options.search_kwargs(), "page_size": 200}
                     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as inner:
@@ -788,14 +791,25 @@ def flex(
             flight_map: dict[str, list[str]] | None = None
             if cabin_avail is not None:
                 tags = []
+                # Per-direction tag: one ✓/✗ per slice (outbound, return, …)
+                num_slices = max(
+                    (max(per_sl.keys(), default=-1) + 1 for per_sl in cabin_avail.values()),
+                    default=0,
+                )
+                if num_slices == 0:
+                    num_slices = 2 if ret else 1
                 for lbl in ("Y", "W", "J"):
-                    avail = cabin_avail[lbl]
-                    if avail:
-                        tags.append(f"[green]{lbl}✓[/green]")
-                    else:
-                        tags.append(f"[red]{lbl}✗[/red]")
+                    per_sl = cabin_avail[lbl]
+                    marks = []
+                    for i in range(num_slices):
+                        marks.append("[green]✓[/green]" if per_sl.get(i) else "[red]✗[/red]")
+                    tags.append(f"{lbl}{''.join(marks)}")
                 cabin_tag = " ".join(tags)
-                flight_map = {lbl: sorted(cabin_avail[lbl]) for lbl in ("Y", "W", "J")}
+                flight_map = {
+                    lbl: sorted(set().union(*cabin_avail[lbl].values()))
+                    if cabin_avail[lbl] else []
+                    for lbl in ("Y", "W", "J")
+                }
             rows.append((dep, ret, price, cheapest.get("displayTotal"), carriers, cabin_tag, flight_map))
 
     rows.sort(key=lambda r: (r[2] is None, r[2] or float("inf")))

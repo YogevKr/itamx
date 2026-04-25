@@ -264,10 +264,28 @@ def search(
             help="IATA city code for point-of-sale (affects fare offers)",
         ),
     ] = None,
+    sort: Annotated[
+        str,
+        typer.Option(
+            "--sort",
+            help="Sort order: default | price | duration | departureTime | arrivalTime",
+        ),
+    ] = "default",
+    max_duration: Annotated[
+        int | None,
+        typer.Option(
+            "--max-duration",
+            help="Drop solutions whose total duration exceeds this many hours (post-filter)",
+            min=1,
+        ),
+    ] = None,
 ) -> None:
-    """Search flights. Returns a price-sorted table with optional fare-class detail."""
-    origin = origin.upper()
-    destination = destination.upper()
+    """Search flights. Returns a price-sorted table with optional fare-class detail.
+
+    `origin`/`destination` may be a single IATA code, a comma-list, or a city
+    code that Matrix expands to all metro airports.
+    """
+    # Note: keep the user's commas in origin/destination — Slice splits internally.
 
     # Compose slices
     al_list = [a for a in airlines.split(",")] if airlines else None
@@ -314,6 +332,7 @@ def search(
                 page_size=page_size,
                 currency=currency,
                 sales_city=sales_city,
+                sorts=sort,
             )
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
@@ -344,6 +363,13 @@ def search(
         parsed.solutionList.solutions,
         key=lambda s: _price_float(s.displayTotal) or float("inf"),
     )
+
+    if max_duration is not None:
+        max_min = max_duration * 60
+        solutions = [
+            s for s in solutions
+            if sum(sl.duration for sl in s.itinerary.slices) <= max_min
+        ]
 
     if output == "json":
         # Strip down to the most useful structured fields
@@ -410,6 +436,7 @@ def search(
     sol_table = Table(title=f"Top {min(top, len(solutions))} solutions by price")
     sol_table.add_column("Price", justify="right")
     sol_table.add_column("Carriers")
+    sol_table.add_column("Stops")
     sol_table.add_column("Out")
     sol_table.add_column("Return")
     sol_table.add_column("Duration")
@@ -421,18 +448,26 @@ def search(
         slices_o = sol.itinerary.slices
         out = slices_o[0] if slices_o else None
         ret_s = slices_o[1] if len(slices_o) > 1 else None
-        out_desc = (
-            f"{_format_time(out.departure)} {out.origin.code}→{out.destination.code} "
-            f"({'/'.join(out.flights)}, {_format_duration(out.duration)})"
-            if out else "?"
-        )
-        ret_desc = (
-            f"{_format_time(ret_s.departure)} {ret_s.origin.code}→{ret_s.destination.code} "
-            f"({'/'.join(ret_s.flights)}, {_format_duration(ret_s.duration)})"
-            if ret_s else "—"
+
+        def _slice_desc(s):
+            stops = max(0, len(s.flights) - 1)
+            return (
+                f"{_format_time(s.departure)} {s.origin.code}→{s.destination.code} "
+                f"({'/'.join(s.flights)}, {_format_duration(s.duration)}"
+                + (f", {stops} stop{'s' if stops != 1 else ''})" if stops else ", nonstop)")
+            )
+
+        out_desc = _slice_desc(out) if out else "?"
+        ret_desc = _slice_desc(ret_s) if ret_s else "—"
+        # Stops summary across slices
+        stops_str = " / ".join(
+            str(max(0, len(s.flights) - 1)) for s in slices_o
         )
         total_dur = sum(s.duration for s in slices_o)
-        cells = [sol.displayTotal, carriers, out_desc, ret_desc, _format_duration(total_dur)]
+        cells = [
+            sol.displayTotal, carriers, stops_str,
+            out_desc, ret_desc, _format_duration(total_dur),
+        ]
         if details_by_id:
             cells.append(_extract_rbd(details_by_id.get(sol.id)))
         sol_table.add_row(*cells)
@@ -444,6 +479,14 @@ def search(
     )
 
 
+def _parse_int_range(spec: str) -> list[int]:
+    """Parse '5' → [5] or '5-8' → [5,6,7,8] for use in --stay etc."""
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        return list(range(int(a), int(b) + 1))
+    return [int(spec)]
+
+
 @app.command()
 def flex(
     origin: Annotated[str, typer.Argument(help="Source IATA code")],
@@ -452,8 +495,15 @@ def flex(
     end: Annotated[str, typer.Argument(help="Latest possible departure YYYY-MM-DD")],
     duration: Annotated[
         int,
-        typer.Option("--duration", "-d", help="Round-trip length in days", min=0, max=60),
+        typer.Option("--duration", "-d", help="Round-trip length in days (one value)", min=0, max=60),
     ] = 7,
+    stay: Annotated[
+        str | None,
+        typer.Option(
+            "--stay",
+            help="Range of trip lengths in days, e.g. '5-8' searches 5/6/7/8-night stays. Overrides --duration.",
+        ),
+    ] = None,
     days: Annotated[
         str,
         typer.Option(
@@ -492,22 +542,36 @@ def flex(
             name_to_idx[d.strip().upper()] for d in days.split(",") if d.strip()
         }
 
-    # Build candidate departure dates
+    # Determine trip lengths to try
+    if stay:
+        try:
+            durations_to_try = _parse_int_range(stay)
+        except ValueError:
+            raise typer.BadParameter(f"--stay must be 'N' or 'N-M' (got {stay!r})")
+    else:
+        durations_to_try = [duration]
+
+    # Build candidate departure dates × trip lengths
     candidates: list[tuple[str, str | None]] = []
     cur = d_start
     while cur <= d_end:
         if weekday_filter and cur.weekday() not in weekday_filter:
             cur += dt.timedelta(days=1)
             continue
-        ret_date = (cur + dt.timedelta(days=duration)).isoformat() if duration > 0 else None
-        candidates.append((cur.isoformat(), ret_date))
+        for dur_days in durations_to_try:
+            ret_date = (
+                (cur + dt.timedelta(days=dur_days)).isoformat() if dur_days > 0 else None
+            )
+            candidates.append((cur.isoformat(), ret_date))
         cur += dt.timedelta(days=1)
 
     if not candidates:
         console.print("[yellow]No candidate dates after filtering[/yellow]")
         raise typer.Exit(1)
 
-    console.print(f"[dim]Searching {len(candidates)} departure date(s)…[/dim]")
+    console.print(
+        f"[dim]Searching {len(candidates)} (depart, return) combinations…[/dim]"
+    )
 
     al_list = [a for a in airlines.split(",")] if airlines else None
     routing = _build_routing(al_list, via)
@@ -558,7 +622,11 @@ def flex(
         ], indent=2))
         return
 
-    table = Table(title=f"Cheapest week  {origin.upper()} ↔ {destination.upper()}  ({duration}-day trip)")
+    dur_label = (
+        f"{stay}-day trip" if stay
+        else (f"{duration}-day trip" if duration > 0 else "one-way")
+    )
+    table = Table(title=f"Cheapest week  {origin.upper()} ↔ {destination.upper()}  ({dur_label})")
     table.add_column("Depart")
     table.add_column("Return" if duration > 0 else "")
     table.add_column("Day")
@@ -716,6 +784,172 @@ def multi(
             cells.append(_extract_rbd(details_by_id.get(sol.id)))
         table.add_row(*cells)
     console.print(table)
+
+
+@app.command()
+def show(
+    origin: Annotated[str, typer.Argument()],
+    destination: Annotated[str, typer.Argument()],
+    depart: Annotated[str, typer.Argument()],
+    ret: Annotated[str | None, typer.Argument()] = None,
+    cabin: Annotated[str, typer.Option("--cabin", "-c")] = "COACH",
+    airlines: Annotated[str | None, typer.Option("--airlines", "-a")] = None,
+    via: Annotated[str | None, typer.Option("--via")] = None,
+    out_time: Annotated[str | None, typer.Option("--out-time")] = None,
+    ret_time: Annotated[str | None, typer.Option("--ret-time")] = None,
+    rank: Annotated[
+        int,
+        typer.Option(
+            "--rank", "-r",
+            help="Which solution to expand (1 = cheapest). Use --list to see options.",
+            min=1,
+        ),
+    ] = 1,
+    list_only: Annotated[
+        bool, typer.Option("--list", help="Just list solutions with their ranks")
+    ] = False,
+) -> None:
+    """Show full segment-by-segment detail for one solution: aircraft, layovers, RBD.
+
+    Re-runs the search and expands the rank-th cheapest solution.
+    """
+    al_list = airlines.split(",") if airlines else None
+    routing = _build_routing(al_list, via)
+    out_slice = Slice(
+        origin=origin, destination=destination, date=depart,
+        route_language=routing,
+        time_ranges=_parse_time_ranges(out_time),
+    )
+    slices = [out_slice]
+    if ret:
+        slices.append(Slice(
+            origin=destination, destination=origin, date=ret,
+            route_language=routing,
+            time_ranges=_parse_time_ranges(ret_time),
+        ))
+
+    with MatrixClient() as client:
+        try:
+            raw = client.search(slices=slices, cabin=cabin.upper(), page_size=50)
+        except Exception as e:
+            console.print(f"[red]Search failed: {e}[/red]")
+            raise typer.Exit(1)
+
+        sols = sorted(
+            raw.get("solutionList", {}).get("solutions", []),
+            key=lambda s: _price_float(s.get("displayTotal")) or float("inf"),
+        )
+        if not sols:
+            console.print("[yellow]No solutions returned[/yellow]")
+            raise typer.Exit(0)
+
+        if list_only:
+            tbl = Table(title="Available solutions")
+            tbl.add_column("Rank")
+            tbl.add_column("Price", justify="right")
+            tbl.add_column("Carriers")
+            tbl.add_column("Itinerary")
+            for i, s in enumerate(sols[:30], 1):
+                slcs = s.get("itinerary", {}).get("slices", [])
+                summary = " / ".join(
+                    f"{sl['origin']['code']}→{sl['destination']['code']} {'/'.join(sl.get('flights', []))}"
+                    for sl in slcs
+                )
+                tbl.add_row(
+                    str(i),
+                    s.get("displayTotal", "?"),
+                    "/".join(c.get("code", "?") for c in s.get("itinerary", {}).get("carriers", [])),
+                    summary,
+                )
+            console.print(tbl)
+            return
+
+        if rank > len(sols):
+            console.print(f"[red]Only {len(sols)} solutions available[/red]")
+            raise typer.Exit(1)
+
+        target = sols[rank - 1]
+        sid = target.get("id")
+        try:
+            d = client.detail(raw, sid, slices, cabin=cabin.upper())
+            booking = d.get("bookingDetails", {})
+        except Exception as e:
+            console.print(f"[yellow]Detail fetch failed: {e}[/yellow]")
+            booking = None
+
+    # Render — header
+    console.print(
+        f"[bold]Rank #{rank}[/bold]  [cyan]{target.get('displayTotal')}[/cyan]  "
+        f"({len(sols)} solutions returned)"
+    )
+    console.print(
+        f"[dim]carriers: {'/'.join(c.get('code','?') for c in target.get('itinerary',{}).get('carriers', []))}[/dim]"
+    )
+    distance = target.get("itinerary", {}).get("distance", {})
+    if distance:
+        console.print(
+            f"[dim]distance: {distance.get('value')} {distance.get('units','')} | "
+            f"price/mile: {target.get('ext',{}).get('pricePerMile','?')}[/dim]"
+        )
+    console.print()
+
+    # Per-slice segments
+    booking_slices = (booking or {}).get("itinerary", {}).get("slices", [])
+    target_slices = target.get("itinerary", {}).get("slices", [])
+    iter_slices = booking_slices or target_slices
+    for i, sl in enumerate(iter_slices, 1):
+        origin_code = sl.get("origin", {}).get("code", "?")
+        dest_code = sl.get("destination", {}).get("code", "?")
+        dep = sl.get("departure", "")
+        arr = sl.get("arrival", "")
+        # Booking details strips slice.duration — sum from segments or fall back to target
+        dur = sl.get("duration", 0)
+        if not dur:
+            dur = sum(seg.get("duration", 0) for seg in sl.get("segments", []))
+            if not dur and i - 1 < len(target_slices):
+                dur = target_slices[i - 1].get("duration", 0)
+        console.print(
+            f"[bold]Leg {i}[/bold]  {origin_code} → {dest_code}  "
+            f"{_format_time(dep)} → {_format_time(arr)}  ({_format_duration(dur)})"
+        )
+
+        segs = sl.get("segments", [])
+        prev_arr = None
+        for seg in segs:
+            carrier = seg.get("carrier", {}).get("code", "?")
+            flt_num = seg.get("flight", {}).get("number", "?")
+            seg_o = seg.get("origin", {}).get("code", "?")
+            seg_d = seg.get("destination", {}).get("code", "?")
+            seg_dep = seg.get("departure", "")
+            seg_arr = seg.get("arrival", "")
+            seg_dur = seg.get("duration", 0)
+            booking_codes = "/".join(
+                bi.get("bookingCode", "?") for bi in seg.get("bookingInfos", [])
+            ) or "?"
+            cabin_classes = "/".join(
+                set(bi.get("cabin", "?") for bi in seg.get("bookingInfos", []))
+            )
+            aircraft = "?"
+            for leg in seg.get("legs", []):
+                if leg.get("aircraft", {}).get("shortName"):
+                    aircraft = leg["aircraft"]["shortName"]
+                    break
+            if prev_arr:
+                from datetime import datetime as _dt
+                try:
+                    a = _dt.fromisoformat(prev_arr); b = _dt.fromisoformat(seg_dep)
+                    layover = int((b - a).total_seconds() / 60)
+                    console.print(f"   [dim]layover at {seg_o}: {_format_duration(layover)}[/dim]")
+                except Exception:
+                    pass
+            console.print(
+                f"   {carrier} {flt_num:<5}  {seg_o}→{seg_d}  "
+                f"{_format_time(seg_dep)} → {_format_time(seg_arr)}  "
+                f"[{_format_duration(seg_dur)}]  "
+                f"{cabin_classes} ({booking_codes})  •  {aircraft}"
+            )
+            prev_arr = seg_arr
+        console.print()
 
 
 if __name__ == "__main__":

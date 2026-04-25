@@ -83,10 +83,15 @@ def _parse_multipart_response(raw: bytes) -> dict[str, Any]:
 
 @dataclass
 class Slice:
-    """One leg of a trip. For one-way: just the outbound. For round-trip: two."""
+    """One leg of a trip. For one-way: just the outbound. For round-trip: two.
 
-    origin: str
-    destination: str
+    `origin` and `destination` accept either a single IATA code or a
+    comma-separated list (e.g. "JFK,LGA,EWR" or "NYC"). City codes (LON, NYC)
+    are interpreted by Matrix to include all metro airports.
+    """
+
+    origin: str  # may contain commas for multi-airport
+    destination: str  # may contain commas for multi-airport
     date: str  # YYYY-MM-DD
     flex_minus: int = 0  # date flexibility — search this many days earlier
     flex_plus: int = 0  # search this many days later
@@ -96,10 +101,14 @@ class Slice:
     time_ranges: list[tuple[str, str]] = field(default_factory=list)
     # ^ list of (min, max) HH:MM windows the slice's flight must depart within
 
+    @staticmethod
+    def _split(codes: str) -> list[str]:
+        return [c.strip().upper() for c in codes.split(",") if c.strip()]
+
     def to_payload(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "origins": [self.origin],
-            "destinations": [self.destination],
+            "origins": self._split(self.origin),
+            "destinations": self._split(self.destination),
             "date": self.date,
             "dateModifier": {"minus": self.flex_minus, "plus": self.flex_plus},
             "isArrivalDate": self.is_arrival_date,
@@ -244,10 +253,14 @@ class MatrixClient:
         change_of_airport: bool = True,
         currency: str | None = None,
         sales_city: str | None = None,
+        sorts: str = "default",
     ) -> dict[str, Any]:
         """Run a search. Returns the raw JSON response dict.
 
         `slices` may have any length: 1 (one-way), 2 (round-trip), or 3+ (multi-city).
+        `sorts`: "default" (Matrix's blend), "price", "duration", "departureTime",
+                 "arrivalTime". Note: the response always carries enough data to
+                 re-sort client-side; this just changes Matrix's chosen ordering.
         """
         body = build_search_body(
             slices=slices,
@@ -259,6 +272,7 @@ class MatrixClient:
             change_of_airport=change_of_airport,
             currency=currency,
             sales_city=sales_city,
+            sorts=sorts,
         )
         return self._post_batch(body, "/v1/search")
 

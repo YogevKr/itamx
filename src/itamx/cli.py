@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from itamx import airlines as airline_db
+from itamx import fleet_hints
 from itamx.client import MatrixClient, Slice
 from itamx.client import _normalize_cabin as _client_normalize_cabin
 from itamx.models import SearchResponse
@@ -74,6 +75,84 @@ def _validated(parser, *args):
         return parser(*args)
     except ValueError as exc:
         raise typer.BadParameter(str(exc))
+
+
+def _diagnose_empty_search(
+    *,
+    origin: str,
+    destination: str,
+    depart: str,
+    ret: str | None,
+    cabin: str,
+    max_stops: int | None,
+    out_routing: str | None,
+    out_cmd: str | None,
+    out_time: str | None,
+    flight: str | None,
+) -> list[str]:
+    """Return a list of human-readable hints for why a search returned 0 results.
+
+    Tries successively-relaxed probes against Matrix to identify which filter
+    most likely killed the search. Cheap: only runs when the original search
+    returned nothing, and uses page_size=5.
+    """
+    hints: list[str] = []
+    try:
+        with MatrixClient() as client:
+            base_slices = build_trip_slices(
+                origin=origin, destination=destination,
+                depart=depart, ret=ret, uppercase_codes=True,
+            )
+            base = client.search(
+                slices=base_slices, cabin="COACH", page_size=5,
+                summarizers=["solutionList"],
+            )
+            base_count = len(base.get("solutionList", {}).get("solutions", []))
+            if base_count == 0:
+                hints.append(
+                    f"Even an unfiltered Y search {origin}→{destination} for "
+                    f"{depart}{(' / ' + ret) if ret else ''} returned 0 — "
+                    "the route or dates may not be operating at all."
+                )
+                return hints
+            else:
+                hints.append(
+                    f"Base Y route works ({base_count} unfiltered results) — "
+                    "a filter is narrowing it to zero."
+                )
+    except Exception as e:
+        hints.append(f"Could not run diagnostic probe: {e}")
+        return hints
+
+    # List likely culprits in order of impact
+    likely: list[str] = []
+    if cabin and cabin.upper() not in ("COACH", "ECONOMY"):
+        likely.append(f"--cabin {cabin}: try COACH first")
+    if max_stops is not None:
+        likely.append(
+            f"--max-stops {max_stops}: relaxing or removing it widens the search"
+        )
+    if flight:
+        likely.append(
+            f"--flight {flight}: the requested flight # may not operate, "
+            "or may be priced out of Matrix's top results"
+        )
+    if out_routing:
+        likely.append(
+            f"--out-routing/--via {out_routing!r}: forced routing may be too restrictive"
+        )
+    if out_cmd:
+        likely.append(
+            f"--out-cmd {out_cmd!r}: command-line filter may be excluding all options"
+        )
+    if out_time:
+        likely.append(
+            f"--out-time {out_time}: time window may be too narrow"
+        )
+    if likely:
+        hints.append("Filters most likely killing the search:")
+        hints.extend(f"  • {h}" for h in likely)
+    return hints
 
 
 def _outbound_flights_unverified(resp: dict) -> dict[int, set[str]]:
@@ -558,6 +637,15 @@ def search(
 
     if not solutions:
         console.print("[yellow]No solutions returned[/yellow]")
+        # Run diagnostic probes only for text output (would clutter json/csv)
+        if output == SearchOutput.text:
+            for h in _diagnose_empty_search(
+                origin=origin, destination=destination,
+                depart=depart, ret=ret, cabin=cabin,
+                max_stops=max_stops, out_routing=out_routing_final,
+                out_cmd=out_cmd_final, out_time=out_time, flight=flight,
+            ):
+                console.print(f"[dim]  {h}[/dim]")
         return
 
     sol_table = Table(title=f"Top {min(top, len(solutions))} solutions by price")
@@ -1420,12 +1508,12 @@ def show(
                 marks.append("[green]W✓[/green]" if "W" in cabins_here else "[red]W✗[/red]")
                 marks.append("[green]J✓[/green]" if "J" in cabins_here else "[red]J✗[/red]")
                 cabin_tag = "  " + " ".join(marks)
-                # Sub-fleet hint specifically for LY 787-9 rotations (V.1 vs V.2)
-                if carrier == "LY" and "787" in (aircraft or ""):
-                    if "W" in cabins_here:
-                        fleet_hint = "  [dim](787-9 V.1 — has PE)[/dim]"
-                    elif "J" in cabins_here:
-                        fleet_hint = "  [dim](787-9 V.2 — no PE)[/dim]"
+                hint = fleet_hints.hint_for(
+                    carrier, aircraft,
+                    has_w="W" in cabins_here, has_j="J" in cabins_here,
+                )
+                if hint:
+                    fleet_hint = f"  [dim]({hint})[/dim]"
             console.print(
                 f"   {carrier} {flt_num:<5}  {seg_o}→{seg_d}  "
                 f"{format_time(seg_dep)} → {format_time(seg_arr)}  "
@@ -1496,6 +1584,163 @@ def airlines_cmd(
             a.get("country") or "—",
         )
     console.print(table)
+
+
+@app.command(name="cache")
+def cache_cmd(
+    action: Annotated[
+        str, typer.Argument(help="Action: stats | clear | clear-stale")
+    ] = "stats",
+    max_age: Annotated[
+        int,
+        typer.Option(
+            "--max-age",
+            help="For clear-stale: drop entries older than this many seconds",
+            min=0,
+        ),
+    ] = 24 * 3600,
+) -> None:
+    """Inspect or purge the on-disk search cache."""
+    from itamx import cache as _cache
+    if action == "stats":
+        s = _cache.stats()
+        console.print(
+            f"Cache entries: [bold]{s['entries']}[/bold]  "
+            f"size: [bold]{s['bytes'] / 1024:.1f} KB[/bold]"
+        )
+        console.print(
+            f"[dim]Disabled: {_cache.is_disabled()}  "
+            f"Default TTL: {_cache.DEFAULT_TTL_SECONDS}s[/dim]"
+        )
+    elif action == "clear":
+        n = _cache.purge()
+        console.print(f"Cleared [bold]{n}[/bold] entries.")
+    elif action == "clear-stale":
+        n = _cache.purge(max_age_seconds=max_age)
+        console.print(f"Cleared [bold]{n}[/bold] entries older than {max_age}s.")
+    else:
+        console.print(f"[red]Unknown action: {action!r}[/red]")
+        raise typer.Exit(2)
+
+
+@app.command(
+    name="watch",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def watch(
+    ctx: typer.Context,
+    interval: Annotated[
+        int,
+        typer.Option(
+            "--interval", "-i",
+            help="Seconds between runs (default 600 = 10 min). Min 30s.",
+            min=30, max=86400,
+        ),
+    ] = 600,
+    diff_only: Annotated[
+        bool,
+        typer.Option(
+            "--diff-only",
+            help="Only print output when something changed vs previous run.",
+        ),
+    ] = False,
+    once: Annotated[
+        bool,
+        typer.Option("--once", help="Run once then exit (sanity-check the command)."),
+    ] = False,
+    on_change: Annotated[
+        str | None,
+        typer.Option(
+            "--on-change",
+            help="Shell command to run when output changes. Diff is piped on stdin.",
+        ),
+    ] = None,
+) -> None:
+    """Re-run any itamx command on an interval, alerting when output changes.
+
+    Pass the wrapped command after `--`. Examples:
+
+        itamx watch -i 600 -- search TLV SFO 2026-05-18 2026-05-24 --airlines LY --scan-cabins
+        itamx watch -i 1800 --on-change 'osascript -e "display notification \"itamx changed\""' -- \\
+            flex TLV SFO 2026-06-01 2026-06-30 --days SUN,MON --airlines LY --scan-cabins
+
+    The wrapped command is run as a subprocess against the same `itamx`
+    executable. Stdout is hashed; on hash change the new output is printed
+    (and a diff vs previous, line-by-line). With --diff-only, identical runs
+    are silent — useful for cron-style background watching.
+    """
+    import hashlib
+    import subprocess
+    import time
+    import os
+    import difflib
+
+    cmd = list(ctx.args)
+    if not cmd:
+        err_console.print("[red]watch: no command given. Pass it after `--`.[/red]")
+        raise typer.Exit(2)
+
+    exe = os.environ.get("ITAMX_BIN") or shutil.which("itamx") or sys.argv[0]
+    full_cmd = [exe, *cmd]
+
+    err_console.print(
+        f"[dim]watch: every {interval}s — `{' '.join(cmd)}`[/dim]"
+    )
+
+    prev_hash: str | None = None
+    prev_output: str = ""
+    iter_count = 0
+    while True:
+        iter_count += 1
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                full_cmd, capture_output=True, text=True, check=False,
+            )
+        except Exception as e:
+            err_console.print(f"[red]watch: invocation failed: {e}[/red]")
+            if once:
+                raise typer.Exit(1)
+            time.sleep(interval)
+            continue
+
+        out = proc.stdout
+        h = hashlib.sha256(out.encode("utf-8")).hexdigest()
+        changed = (prev_hash is not None and h != prev_hash)
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        if iter_count == 1:
+            err_console.print(f"[dim]{ts}  initial run[/dim]")
+            print(out, end="")
+        elif changed:
+            err_console.print(f"[bold yellow]{ts}  CHANGE detected[/bold yellow]")
+            diff = "".join(
+                difflib.unified_diff(
+                    prev_output.splitlines(keepends=True),
+                    out.splitlines(keepends=True),
+                    fromfile="previous", tofile="current", n=3,
+                )
+            )
+            print(diff or out, end="")
+            if on_change:
+                try:
+                    subprocess.run(
+                        on_change, shell=True, input=diff, text=True, timeout=30,
+                    )
+                except Exception as e:
+                    err_console.print(f"[yellow]on-change failed: {e}[/yellow]")
+        else:
+            if not diff_only:
+                err_console.print(f"[dim]{ts}  no change[/dim]")
+
+        prev_hash = h
+        prev_output = out
+
+        if once:
+            return
+        elapsed = time.time() - started
+        sleep_s = max(5, interval - elapsed)
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

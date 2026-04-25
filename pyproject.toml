@@ -1,6 +1,6 @@
 [project]
 name = "itamx"
-version = "0.2.8"
+version = "0.2.10"
 description = "CLI for ITA Matrix airfare search (reverse-engineered JSON API)"
 readme = "README.md"
 authors = [
@@ -54,4 +54,9 @@ target-version = "py312"
 [dependency-groups]
 dev = [
     "ruff>=0.15.12",
+    "pytest>=8",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

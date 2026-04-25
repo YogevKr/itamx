@@ -279,6 +279,7 @@ class MatrixClient:
         currency: str | None = None,
         sales_city: str | None = None,
         sorts: str = "default",
+        cache_ttl: int | None = None,
     ) -> dict[str, Any]:
         """Run a search. Returns the raw JSON response dict.
 
@@ -286,6 +287,9 @@ class MatrixClient:
         `sorts`: "default" (Matrix's blend), "price", "duration", "departureTime",
                  "arrivalTime". Note: the response always carries enough data to
                  re-sort client-side; this just changes Matrix's chosen ordering.
+        `cache_ttl`: if set (seconds), check the on-disk cache first and store
+                 fresh responses. Set 0 to skip the cache entirely. Default None
+                 uses the cache module's DEFAULT_TTL_SECONDS.
         """
         body = build_search_body(
             slices=slices,
@@ -299,7 +303,22 @@ class MatrixClient:
             sales_city=sales_city,
             sorts=sorts,
         )
-        return self._post_batch(body, "/v1/search")
+
+        # Cache check: skip when cache_ttl=0 (explicit bypass).
+        if cache_ttl != 0:
+            from itamx import cache as _cache
+            ttl = cache_ttl if cache_ttl is not None else _cache.DEFAULT_TTL_SECONDS
+            hit = _cache.get(body, ttl=ttl)
+            if hit is not None:
+                return hit
+
+        resp = self._post_batch(body, "/v1/search")
+
+        if cache_ttl != 0:
+            from itamx import cache as _cache
+            _cache.put(body, resp)
+
+        return resp
 
     def lookup_locations(
         self, partial_name: str, *, page_size: int = 10

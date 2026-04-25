@@ -1,14 +1,16 @@
 """HTTP client for ITA Matrix search API.
 
-Matrix uses Google's Alkali framework: single POST to
-content-alkalimatrix-pa.googleapis.com/batch wrapping an inner JSON-RPC call
-in multipart/mixed format. Public API key embedded in the page.
+Matrix is a Google "Alkali" framework app. Single POST to
+content-alkalimatrix-pa.googleapis.com/batch wraps an inner JSON-RPC call in
+multipart/mixed format. Auth is just a public API key embedded in the page —
+no OAuth, no anti-bot tokens needed for search/summarize calls.
 """
 
 from __future__ import annotations
 
 import json
 import secrets
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -76,57 +78,98 @@ def _parse_multipart_response(raw: bytes) -> dict[str, Any]:
     end = text.rfind("}")
     if end < start:
         raise ValueError("Malformed JSON body in response")
-    # The JSON sits between the inner HTTP headers and the closing boundary.
-    # rfind('}') gives us the end of the outermost object.
-    candidate = text[start : end + 1]
-    return json.loads(candidate)
+    return json.loads(text[start : end + 1])
 
 
-def build_search_body(
-    origin: str,
-    destination: str,
-    depart_date: str,
-    return_date: str | None = None,
-    adults: int = 1,
-    cabin: str = "COACH",
-    max_stops: int | None = None,
-    summarizers: list[str] | None = None,
-    page_size: int = 50,
-) -> dict[str, Any]:
-    """Build the inner JSON-RPC payload for a Matrix search.
+@dataclass
+class Slice:
+    """One leg of a trip. For one-way: just the outbound. For round-trip: two."""
 
-    Dates in YYYY-MM-DD. Cabin is one of COACH, PREMIUM_COACH, BUSINESS, FIRST.
-    """
+    origin: str
+    destination: str
+    date: str  # YYYY-MM-DD
+    flex_minus: int = 0  # date flexibility — search this many days earlier
+    flex_plus: int = 0  # search this many days later
+    is_arrival_date: bool = False
+    route_language: str | None = None  # e.g. "LAX" forces transit through LAX
+    command_line: str | None = None  # e.g. "f bc=S|M|H" filters fare buckets
+    time_ranges: list[tuple[str, str]] = field(default_factory=list)
+    # ^ list of (min, max) HH:MM windows the slice's flight must depart within
 
-    def slice_(o: str, d: str, date: str) -> dict[str, Any]:
-        return {
-            "origins": [o],
-            "destinations": [d],
-            "date": date,
-            "dateModifier": {"minus": 0, "plus": 0},
-            "isArrivalDate": False,
+    def to_payload(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "origins": [self.origin],
+            "destinations": [self.destination],
+            "date": self.date,
+            "dateModifier": {"minus": self.flex_minus, "plus": self.flex_plus},
+            "isArrivalDate": self.is_arrival_date,
             "filter": {"warnings": {"values": []}},
             "selected": False,
         }
+        if self.route_language:
+            out["routeLanguage"] = self.route_language
+        if self.command_line:
+            out["commandLine"] = self.command_line
+        if self.time_ranges:
+            out["timeRanges"] = [{"min": a, "max": b} for a, b in self.time_ranges]
+        return out
 
-    slices = [slice_(origin, destination, depart_date)]
-    if return_date:
-        slices.append(slice_(destination, origin, return_date))
 
+@dataclass
+class PaxCount:
+    adults: int = 1
+    seniors: int = 0
+    youths: int = 0
+    children: int = 0
+    infants_in_seat: int = 0
+    infants_in_lap: int = 0
+
+    def to_payload(self) -> dict[str, int]:
+        out: dict[str, int] = {"adults": self.adults}
+        if self.seniors:
+            out["seniors"] = self.seniors
+        if self.youths:
+            out["youths"] = self.youths
+        if self.children:
+            out["children"] = self.children
+        if self.infants_in_seat:
+            out["infantsInSeat"] = self.infants_in_seat
+        if self.infants_in_lap:
+            out["infantsInLap"] = self.infants_in_lap
+        return out
+
+
+def build_search_body(
+    slices: list[Slice],
+    *,
+    pax: PaxCount | None = None,
+    cabin: str = "COACH",
+    max_stops: int | None = None,
+    page_size: int = 50,
+    summarizers: list[str] | None = None,
+    sorts: str = "default",
+    change_of_airport: bool = True,
+) -> dict[str, Any]:
+    """Build the inner JSON-RPC payload for a Matrix /v1/search call.
+
+    `cabin`: COACH, PREMIUM_COACH, BUSINESS, FIRST.
+    `max_stops`: number of stops *relative to the route minimum*. 0 = nonstop only,
+                 1 = up to 1 extra stop, etc. Matrix calls this maxLegsRelativeToMin.
+    """
     return {
         "summarizers": summarizers or DEFAULT_SUMMARIZERS,
         "inputs": {
             "filter": {},
             "page": {"current": 1, "size": page_size},
-            "pax": {"adults": adults},
-            "slices": slices,
+            "pax": (pax or PaxCount()).to_payload(),
+            "slices": [s.to_payload() for s in slices],
             "firstDayOfWeek": "SUNDAY",
             "internalUser": False,
             "sliceIndex": 0,
-            "sorts": "default",
+            "sorts": sorts,
             "cabin": cabin,
-            "maxLegsRelativeToMin": 0 if max_stops is None else max_stops,
-            "changeOfAirport": True,
+            "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,
+            "changeOfAirport": change_of_airport,
             "checkAvailability": True,
         },
         "summarizerSet": "wholeTrip",
@@ -137,9 +180,8 @@ def build_search_body(
 class MatrixClient:
     """Synchronous client for ITA Matrix search.
 
-    Each `.search()` call is a single HTTPS round-trip. No token juggling,
-    no cookies required — the API is currently keyed only by the embedded
-    public API key.
+    Each call is a single HTTPS round-trip. No token juggling, no cookies —
+    just the public API key embedded in the page.
     """
 
     def __init__(
@@ -182,28 +224,24 @@ class MatrixClient:
 
     def search(
         self,
-        origin: str,
-        destination: str,
-        depart_date: str,
-        return_date: str | None = None,
+        slices: list[Slice],
         *,
-        adults: int = 1,
+        pax: PaxCount | None = None,
         cabin: str = "COACH",
         max_stops: int | None = None,
         page_size: int = 50,
         summarizers: list[str] | None = None,
+        change_of_airport: bool = True,
     ) -> dict[str, Any]:
         """Run a search. Returns the raw JSON response dict."""
         body = build_search_body(
-            origin=origin,
-            destination=destination,
-            depart_date=depart_date,
-            return_date=return_date,
-            adults=adults,
+            slices=slices,
+            pax=pax,
             cabin=cabin,
             max_stops=max_stops,
             page_size=page_size,
             summarizers=summarizers,
+            change_of_airport=change_of_airport,
         )
         return self._post_batch(body, "/v1/search")
 
@@ -211,48 +249,24 @@ class MatrixClient:
         self,
         search_response: dict[str, Any],
         solution_id: str,
+        slices: list[Slice],
         *,
-        origin: str,
-        destination: str,
-        depart_date: str,
-        return_date: str | None = None,
-        adults: int = 1,
+        pax: PaxCount | None = None,
         cabin: str = "COACH",
     ) -> dict[str, Any]:
-        """Fetch booking details (incl. fare bookingCode) for one solution.
-
-        Pass the full search response dict and the per-solution `id`. The
-        session + solutionSet are pulled from the search response.
-        """
+        """Fetch booking details (incl. fare bookingCode) for one solution."""
         solution_set = search_response.get("solutionSet")
         session = search_response.get("session")
         if not solution_set or not session:
-            raise ValueError(
-                "search_response is missing solutionSet/session — was it a successful search?"
-            )
-
-        def slice_(o: str, d: str, date: str) -> dict[str, Any]:
-            return {
-                "origins": [o],
-                "destinations": [d],
-                "date": date,
-                "dateModifier": {"minus": 0, "plus": 0},
-                "isArrivalDate": False,
-                "filter": {"warnings": {"values": []}},
-                "selected": False,
-            }
-
-        slices = [slice_(origin, destination, depart_date)]
-        if return_date:
-            slices.append(slice_(destination, origin, return_date))
+            raise ValueError("search_response missing solutionSet/session")
 
         body = {
             "summarizers": ["bookingDetails"],
             "inputs": {
                 "filter": {},
                 "page": {"current": 1, "size": 25},
-                "pax": {"adults": adults},
-                "slices": slices,
+                "pax": (pax or PaxCount()).to_payload(),
+                "slices": [s.to_payload() for s in slices],
                 "firstDayOfWeek": "SUNDAY",
                 "internalUser": False,
                 "sliceIndex": 0,

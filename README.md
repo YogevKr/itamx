@@ -6,6 +6,8 @@ CLI for **ITA Matrix** airfare search — the engine behind Google Flights, Kaya
 
 ```bash
 uv tool install /path/to/itamx
+# with MCP server support
+uv tool install '/path/to/itamx[mcp]'
 # or from source
 uv sync && uv run itamx --help
 ```
@@ -117,6 +119,44 @@ itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE -o json | jq '.solutions
 
 Exit codes: `0` on success, `1` on search failure or no matches.
 
+### MCP server
+
+`itamx` also exposes Matrix search tools over the Model Context Protocol:
+
+```bash
+itamx-mcp       # STDIO transport
+itamx-mcp-http  # streamable HTTP at http://127.0.0.1:8000/mcp/
+```
+
+For local development:
+
+```bash
+uv run --extra mcp itamx-mcp
+uv run --extra mcp itamx-mcp-http
+```
+
+Claude Desktop style configuration:
+
+```json
+{
+  "mcpServers": {
+    "itamx": {
+      "command": "itamx-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Available tools:
+
+| Tool | Purpose |
+|---|---|
+| `search_flights` | Search one-way or round-trip Matrix fares |
+| `search_dates` | Scan a departure-date range and return cheapest date results |
+| `search_locations` | Autocomplete Matrix city and airport locations |
+| `search_airlines` | Resolve airline names and codes |
+
 ### Python library
 
 `itamx` is also importable directly — no subprocess needed:
@@ -204,3 +244,14 @@ the QPX engine):
 If Matrix changes the request format, run `node /tmp/matrix-cap-node.js` (in
 this repo's history) — a Playwright + CDP harness that captures live
 request/response bodies for both `/v1/search` and `/v1/summarize`.
+
+## Credits
+
+`itamx` was inspired by [`fli`](https://github.com/punitarani/fli), Punit Arani's
+Google Flights CLI and MCP server. `itamx` applies a similar CLI/MCP workflow to
+ITA Matrix. `fli` remains a separate MIT-licensed project; no `fli` package code
+is vendored here.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

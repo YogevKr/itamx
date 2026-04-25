@@ -6,7 +6,16 @@ readme = "README.md"
 authors = [
     { name = "YogevKr", email = "yogev@sawmills.ai" }
 ]
+license = "MIT"
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
@@ -14,8 +23,22 @@ dependencies = [
     "rich>=13.7",
 ]
 
+[project.optional-dependencies]
+mcp = [
+    "fastmcp>=3.2",
+    "uvicorn>=0.34.0",
+]
+all = [
+    "itamx[mcp]",
+]
+
 [project.scripts]
 itamx = "itamx.cli:app"
+itamx-mcp = "itamx.mcp._entry:run"
+itamx-mcp-http = "itamx.mcp._entry:run_http"
+
+[project.urls]
+Repository = "https://github.com/YogevKr/itamx"
 
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]

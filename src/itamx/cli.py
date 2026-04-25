@@ -219,6 +219,14 @@ def search(
             min=1,
         ),
     ] = None,
+    scan_cabins: Annotated[
+        bool,
+        typer.Option(
+            "--scan-cabins",
+            help="Also probe Premium Economy and Business cabins; tag each row with "
+                 "Y/W/J availability per outbound flight. ~3× slower (2 extra searches).",
+        ),
+    ] = False,
 ) -> None:
     """Search flights. Returns a price-sorted table with optional fare-class detail.
 
@@ -280,6 +288,44 @@ def search(
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
             raise typer.Exit(1)
+
+        # Optional: probe W and J cabins in parallel and collect the set of
+        # outbound flight numbers each cabin carries. Used to tag rows with
+        # cabin availability (catches things like "no PE cabin on the V.2 787").
+        cabin_avail: dict[str, set[str]] = {"Y": set(), "W": set(), "J": set()}
+        if scan_cabins:
+            err_console.print(
+                "[dim]Scanning Premium Economy and Business cabins…[/dim]"
+            )
+
+            def _flights_in_response(resp: dict) -> set[str]:
+                flights: set[str] = set()
+                for sol in resp.get("solutionList", {}).get("solutions", []):
+                    for sl in sol.get("itinerary", {}).get("slices", []):
+                        # The first flight of a slice is the long-haul leg the
+                        # user cares about for cabin availability.
+                        for f in sl.get("flights", [])[:1]:
+                            flights.add(f)
+                return flights
+
+            cabin_avail["Y"] = _flights_in_response(raw)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                futures = {
+                    label: ex.submit(
+                        client.search,
+                        slices=slices,
+                        pax=pax,
+                        **{**options.search_kwargs(), "cabin": cabin_code},
+                    )
+                    for label, cabin_code in (("W", "PREMIUM_COACH"), ("J", "BUSINESS"))
+                }
+                for label, fut in futures.items():
+                    try:
+                        cabin_avail[label] = _flights_in_response(fut.result())
+                    except Exception as e:
+                        err_console.print(
+                            f"[yellow]  {label} scan failed: {e}[/yellow]"
+                        )
 
         details_by_id: dict[str, dict] = {}
         if detail > 0:
@@ -389,6 +435,8 @@ def search(
     sol_table.add_column("Out")
     sol_table.add_column("Return")
     sol_table.add_column("Duration")
+    if scan_cabins:
+        sol_table.add_column("Cabins")
     if details_by_id:
         sol_table.add_column("RBD")
 
@@ -417,6 +465,21 @@ def search(
             sol.displayTotal, carriers, stops_str,
             out_desc, ret_desc, format_duration(total_dur),
         ]
+        if scan_cabins:
+            # Mark a cabin ✓ only if EVERY long-haul leg of this solution
+            # appears in that cabin's availability set. ✗ means at least one
+            # leg has no inventory in that cabin.
+            row_flights = [
+                sl.flights[0] for sl in slices_o if sl.flights
+            ]
+            tags = []
+            for label in ("Y", "W", "J"):
+                avail = cabin_avail[label]
+                if all(f in avail for f in row_flights) and avail:
+                    tags.append(f"[green]{label}✓[/green]")
+                else:
+                    tags.append(f"[red]{label}✗[/red]")
+            cells.append(" ".join(tags))
         if details_by_id:
             cells.append(extract_rbd(details_by_id.get(sol.id)))
         sol_table.add_row(*cells)

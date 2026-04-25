@@ -524,6 +524,14 @@ def flex(
     parallel: Annotated[
         int, typer.Option("--parallel", "-p", help="Concurrent searches", min=1, max=8)
     ] = 3,
+    scan_cabins: Annotated[
+        bool,
+        typer.Option(
+            "--scan-cabins",
+            help="For each date, also probe Premium Economy and Business and tag with "
+                 "Y/W/J availability + per-flight cabin map. ~3× slower per date.",
+        ),
+    ] = False,
     output: Annotated[
         TableOutput, typer.Option("--output", "-o", help="Output format")
     ] = TableOutput.text,
@@ -579,7 +587,15 @@ def flex(
     routing = _build_cli_routing(al_list, via)
     options = SearchOptions(cabin=cabin.upper(), max_stops=max_stops, page_size=20)
 
-    def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, str | None]:
+    def _outbound_flights(resp: dict) -> set[str]:
+        flights: set[str] = set()
+        for s in resp.get("solutionList", {}).get("solutions", []):
+            slcs = s.get("itinerary", {}).get("slices", [])
+            if slcs and slcs[0].get("flights"):
+                flights.add(slcs[0]["flights"][0])
+        return flights
+
+    def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, dict[str, set[str]] | None, str | None]:
         slices = build_trip_slices(
             origin=origin,
             destination=destination,
@@ -597,44 +613,94 @@ def flex(
                     slices=slices,
                     **options.search_kwargs(),
                 )
-            return dep, ret, resp, None
+                cabin_avail: dict[str, set[str]] | None = None
+                if scan_cabins:
+                    cabin_avail = {"Y": _outbound_flights(resp), "W": set(), "J": set()}
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as inner:
+                        futures = {
+                            label: inner.submit(
+                                client.search,
+                                slices=slices,
+                                **{**options.search_kwargs(), "cabin": cabin_code},
+                            )
+                            for label, cabin_code in (("W", "PREMIUM_COACH"), ("J", "BUSINESS"))
+                        }
+                        for label, fut in futures.items():
+                            try:
+                                cabin_avail[label] = _outbound_flights(fut.result())
+                            except Exception:
+                                pass
+            return dep, ret, resp, cabin_avail, None
         except Exception as e:
-            return dep, ret, None, str(e)
+            return dep, ret, None, None, str(e)
 
-    rows: list[tuple[str, str | None, float | None, str | None, str | None]] = []
+    # row tuple: (dep, ret, price_float, displayPrice, carriers, cabin_tag, flight_map)
+    rows: list[tuple[str, str | None, float | None, str | None, str | None, str | None, dict[str, list[str]] | None]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
-        for dep, ret, resp, err in ex.map(lambda c: run_one(*c), candidates):
+        for dep, ret, resp, cabin_avail, err in ex.map(lambda c: run_one(*c), candidates):
             if err:
-                rows.append((dep, ret, None, "—", err[:60]))
+                rows.append((dep, ret, None, "—", err[:60], None, None))
                 continue
             sols = resp.get("solutionList", {}).get("solutions", [])
             if not sols:
-                rows.append((dep, ret, None, "—", None))
+                rows.append((dep, ret, None, "—", None, None, None))
                 continue
             cheapest = min(sols, key=lambda s: price_float(s.get("displayTotal")) or float("inf"))
             price = price_float(cheapest.get("displayTotal"))
             carriers = "/".join(c.get("code", "?") for c in cheapest.get("itinerary", {}).get("carriers", []))
-            rows.append((dep, ret, price, cheapest.get("displayTotal"), carriers))
+
+            cabin_tag = None
+            flight_map: dict[str, list[str]] | None = None
+            if cabin_avail is not None:
+                tags = []
+                for lbl in ("Y", "W", "J"):
+                    avail = cabin_avail[lbl]
+                    if avail:
+                        tags.append(f"[green]{lbl}✓[/green]")
+                    else:
+                        tags.append(f"[red]{lbl}✗[/red]")
+                cabin_tag = " ".join(tags)
+                flight_map = {lbl: sorted(cabin_avail[lbl]) for lbl in ("Y", "W", "J")}
+            rows.append((dep, ret, price, cheapest.get("displayTotal"), carriers, cabin_tag, flight_map))
 
     rows.sort(key=lambda r: (r[2] is None, r[2] or float("inf")))
 
     if output == TableOutput.json:
-        print(json_module.dumps([
-            {
+        out = []
+        for dep, ret, price, disp, car, _tag, fmap in rows:
+            entry = {
                 "depart": dep, "return": ret,
                 "day": dt.date.fromisoformat(dep).strftime("%A"),
                 "price": price, "displayPrice": disp, "carriers": car,
             }
-            for dep, ret, price, disp, car in rows
-        ], indent=2))
+            if fmap is not None:
+                entry["cabins"] = {
+                    lbl: {"available": bool(fmap[lbl]), "flights": fmap[lbl]}
+                    for lbl in ("Y", "W", "J")
+                }
+            out.append(entry)
+        print(json_module.dumps(out, indent=2))
         return
 
     if output == TableOutput.csv:
         writer = csv_module.writer(sys.stdout)
-        writer.writerow(["depart", "return", "day", "price", "display_price", "carriers"])
-        for dep, ret, price, disp, car in rows:
+        header = ["depart", "return", "day", "price", "display_price", "carriers"]
+        if scan_cabins:
+            header += ["y_flights", "w_flights", "j_flights"]
+        writer.writerow(header)
+        for dep, ret, price, disp, car, _tag, fmap in rows:
             wkday = dt.date.fromisoformat(dep).strftime("%a")
-            writer.writerow([dep, ret or "", wkday, price or "", disp or "", car or ""])
+            row = [dep, ret or "", wkday, price or "", disp or "", car or ""]
+            if scan_cabins:
+                if fmap:
+                    row += [
+                        ",".join(fmap["Y"]),
+                        ",".join(fmap["W"]),
+                        ",".join(fmap["J"]),
+                    ]
+                else:
+                    row += ["", "", ""]
+            writer.writerow(row)
         return
 
     dur_label = (
@@ -647,10 +713,36 @@ def flex(
     table.add_column("Day")
     table.add_column("Price", justify="right")
     table.add_column("Carriers")
-    for dep, ret, price, disp, car in rows:
+    if scan_cabins:
+        table.add_column("Cabins")
+        table.add_column("PE flights")
+    for dep, ret, price, disp, car, tag, fmap in rows:
         wkday = dt.date.fromisoformat(dep).strftime("%a")
-        table.add_row(dep, ret or "—", wkday, disp or "—", car or "—")
+        cells = [dep, ret or "—", wkday, disp or "—", car or "—"]
+        if scan_cabins:
+            cells.append(tag or "—")
+            cells.append(", ".join(fmap["W"]) if fmap and fmap["W"] else "—")
+        table.add_row(*cells)
     console.print(table)
+
+    # Optional rollup: which outbound flights have PE on which dates
+    if scan_cabins:
+        pe_by_flight: dict[str, list[str]] = {}
+        for dep, ret, *_, fmap in rows:
+            if not fmap:
+                continue
+            for f in fmap["W"]:
+                pe_by_flight.setdefault(f, []).append(dep)
+        if pe_by_flight:
+            console.print(
+                f"\n[bold]PE-equipped flights across the scan:[/bold]"
+            )
+            for flt in sorted(pe_by_flight):
+                dates = pe_by_flight[flt]
+                console.print(
+                    f"  [green]{flt}[/green]: {len(dates)}/{len(rows)} dates  "
+                    f"→ {', '.join(dates)}"
+                )
 
 
 @app.command()

@@ -1,0 +1,56 @@
+{
+  "solutionCount": 2,
+  "session": "fixture-session",
+  "solutionList": {
+    "solutions": [
+      {
+        "id": "expensive",
+        "displayTotal": "USD300.00",
+        "itinerary": {
+          "carriers": [{"code": "BB", "shortName": "Beta Air"}],
+          "slices": [
+            {
+              "origin": {"code": "SRC", "name": "Source"},
+              "destination": {"code": "DST", "name": "Destination"},
+              "departure": "2099-01-01T10:00:00",
+              "arrival": "2099-01-01T12:30:00",
+              "flights": ["BB200"],
+              "cabins": ["COACH"],
+              "duration": 150
+            }
+          ]
+        }
+      },
+      {
+        "id": "cheap",
+        "displayTotal": "USD100.00",
+        "itinerary": {
+          "carriers": [{"code": "AA", "shortName": "Alpha Air"}],
+          "slices": [
+            {
+              "origin": {"code": "SRC", "name": "Source"},
+              "destination": {"code": "DST", "name": "Destination"},
+              "departure": "2099-01-01T08:00:00",
+              "arrival": "2099-01-01T09:45:00",
+              "flights": ["AA100"],
+              "cabins": ["COACH"],
+              "duration": 105
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "carrierStopMatrix": {
+    "columns": [{"label": {"code": "AA"}}, {"label": {"code": "BB"}}],
+    "rows": [
+      {
+        "label": 0,
+        "cells": [
+          {"minPrice": "USD100.00", "minPriceInGrid": true},
+          {"minPrice": "USD300.00", "minPriceInGrid": false}
+        ]
+      }
+    ]
+  }
+}

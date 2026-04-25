@@ -13,6 +13,7 @@ from itamx.client import MatrixClient, PaxCount, Slice
 from itamx.models import SearchResponse, Solution
 from itamx.render import price_float
 from itamx.request_options import SearchOptions
+from itamx.search_builder import build_pax_count, build_routing, build_trip_slices
 from itamx.validation import parse_time_ranges, parse_weekdays
 
 ClientFactory = Callable[[], MatrixClient]
@@ -102,40 +103,6 @@ def _parse_date(value: str) -> dt.date:
         raise ValueError(f"date must be YYYY-MM-DD (got {value!r})")
 
 
-def _resolve_airlines(tokens: list[str] | None) -> list[str]:
-    out: list[str] = []
-    for token in tokens or []:
-        cleaned = token.strip()
-        if not cleaned:
-            continue
-        out.append(airline_db.resolve(cleaned) or cleaned.upper())
-    return out
-
-
-def _build_routing(airlines: list[str] | None, via: str | None) -> str | None:
-    codes = _resolve_airlines(airlines)
-    airline_token = None
-    if codes:
-        airline_token = f"{codes[0]}+" if len(codes) == 1 else f"({'|'.join(codes)})+"
-
-    via_token = via.strip().upper() if via else None
-    if airline_token and via_token:
-        return f"{airline_token} {via_token} {airline_token}"
-    return airline_token or via_token
-
-
-def _pax(adults: int, *, seniors: int = 0, youths: int = 0, children: int = 0,
-         infants_seat: int = 0, infants_lap: int = 0) -> PaxCount:
-    return PaxCount(
-        adults=adults,
-        seniors=seniors,
-        youths=youths,
-        children=children,
-        infants_in_seat=infants_seat,
-        infants_in_lap=infants_lap,
-    )
-
-
 def _serialize_solution(solution: Solution) -> dict[str, Any]:
     slices = []
     for slice_ in solution.itinerary.slices:
@@ -191,32 +158,21 @@ def _execute_flight_search(
             _parse_date(params.return_date)
         cabin = _validate_cabin(params.cabin)
         sort = _validate_sort(params.sort)
-        routing = _build_routing(params.airlines, params.via)
-        outbound = Slice(
+        routing = build_routing(params.airlines, params.via)
+        slices = build_trip_slices(
             origin=params.source.upper(),
             destination=params.destination.upper(),
-            date=params.depart_date,
-            flex_minus=params.flex_days,
-            flex_plus=params.flex_days,
-            route_language=routing,
-            time_ranges=parse_time_ranges(params.outbound_time),
+            depart=params.depart_date,
+            ret=params.return_date,
+            flex=params.flex_days,
+            outbound_routing=routing,
+            return_routing=routing,
+            outbound_time_ranges=parse_time_ranges(params.outbound_time),
+            return_time_ranges=parse_time_ranges(params.return_time),
         )
-        slices = [outbound]
-        if params.return_date:
-            slices.append(
-                Slice(
-                    origin=params.destination.upper(),
-                    destination=params.source.upper(),
-                    date=params.return_date,
-                    flex_minus=params.flex_days,
-                    flex_plus=params.flex_days,
-                    route_language=routing,
-                    time_ranges=parse_time_ranges(params.return_time),
-                )
-            )
 
-        pax = _pax(
-            params.adults,
+        pax = build_pax_count(
+            adults=params.adults,
             seniors=params.seniors,
             youths=params.youths,
             children=params.children,
@@ -278,8 +234,8 @@ def _execute_date_search(
         if not dates:
             raise ValueError("No candidate dates match the requested range and weekdays")
 
-        routing = _build_routing(params.airlines, params.via)
-        pax = _pax(params.adults)
+        routing = build_routing(params.airlines, params.via)
+        pax = build_pax_count(adults=params.adults)
         options = SearchOptions(
             cabin=cabin,
             max_stops=params.max_stops,
@@ -296,23 +252,15 @@ def _execute_date_search(
                     if params.duration_days
                     else None
                 )
-                outbound = Slice(
+                slices = build_trip_slices(
                     origin=params.source.upper(),
                     destination=params.destination.upper(),
-                    date=depart.isoformat(),
-                    route_language=routing,
-                    time_ranges=parse_time_ranges(params.outbound_time),
+                    depart=depart.isoformat(),
+                    ret=return_date.isoformat() if return_date else None,
+                    outbound_routing=routing,
+                    return_routing=routing,
+                    outbound_time_ranges=parse_time_ranges(params.outbound_time),
                 )
-                slices = [outbound]
-                if return_date:
-                    slices.append(
-                        Slice(
-                            origin=params.destination.upper(),
-                            destination=params.source.upper(),
-                            date=return_date.isoformat(),
-                            route_language=routing,
-                        )
-                    )
                 raw = _search_with_client(client, slices, pax, options)
                 _, solutions = _sorted_solutions(raw)
                 if not solutions:

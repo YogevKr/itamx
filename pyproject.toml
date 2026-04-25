@@ -7,6 +7,7 @@ authors = [
     { name = "YogevKr", email = "yogev@sawmills.ai" }
 ]
 license = "MIT"
+keywords = ["flights", "ita-matrix", "airfare", "mcp", "travel", "cli"]
 requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -38,7 +39,9 @@ itamx-mcp = "itamx.mcp._entry:run"
 itamx-mcp-http = "itamx.mcp._entry:run_http"
 
 [project.urls]
+Homepage = "https://github.com/YogevKr/itamx"
 Repository = "https://github.com/YogevKr/itamx"
+Issues = "https://github.com/YogevKr/itamx/issues"
 
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]

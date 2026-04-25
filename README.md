@@ -137,6 +137,10 @@ uv run --extra mcp itamx-mcp-http
 
 Claude Desktop style configuration:
 
+```bash
+itamx mcp-config
+```
+
 ```json
 {
   "mcpServers": {

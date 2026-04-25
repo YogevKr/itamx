@@ -6,6 +6,7 @@ import concurrent.futures
 import csv as csv_module
 import datetime as dt
 import json as json_module
+import shutil
 import sys
 from typing import Annotated
 
@@ -14,10 +15,17 @@ from rich.console import Console
 from rich.table import Table
 
 from itamx import airlines as airline_db
-from itamx.client import MatrixClient, PaxCount, Slice
+from itamx.client import MatrixClient, Slice
 from itamx.models import SearchResponse
 from itamx.request_options import SearchOptions
 from itamx.render import extract_rbd, format_duration, format_time, price_float
+from itamx.search_builder import (
+    build_pax_count,
+    build_routing,
+    build_trip_slices,
+    combine_commands,
+    rbd_command,
+)
 from itamx.validation import (
     SearchOutput,
     ShowOutput,
@@ -34,79 +42,30 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+err_console = Console(stderr=True)
 
 
-def _rbd_command(rbds: list[str] | None) -> str | None:
-    """Convert ['S','M','H'] into Matrix's `f bc=S|M|H` fare-class filter."""
-    if not rbds:
-        return None
-    codes = [r.strip().upper() for r in rbds if r.strip()]
-    if not codes:
-        return None
-    return f"f bc={'|'.join(codes)}"
+def _log_airline_resolved(raw: str, resolved: str) -> None:
+    err_console.print(f"[dim]  {raw!r} → {resolved} ({airline_db.by_iata(resolved)['name']})[/dim]")
 
 
-def _resolve_airlines(tokens: list[str] | None) -> list[str]:
-    """Map a list of free-form tokens (IATA codes or partial names) to IATA codes.
-
-    Tokens that don't resolve cleanly (ambiguous or unknown) keep their original
-    upper-cased form — Matrix will treat them as raw IATA.
-    Logs unresolved tokens to stderr so the user knows.
-    """
-    out: list[str] = []
-    err = Console(stderr=True)
-    for raw in tokens or []:
-        t = raw.strip()
-        if not t:
-            continue
-        resolved = airline_db.resolve(t)
-        if resolved:
-            out.append(resolved)
-            if resolved != t.upper():
-                err.print(f"[dim]  {t!r} → {resolved} ({airline_db.by_iata(resolved)['name']})[/dim]")
-        else:
-            err.print(f"[yellow]  {t!r}: no unique airline match — passing through as-is[/yellow]")
-            out.append(t.upper())
-    return out
+def _log_airline_unresolved(raw: str) -> None:
+    err_console.print(f"[yellow]  {raw!r}: no unique airline match — passing through as-is[/yellow]")
 
 
-def _build_routing(
+def _build_cli_routing(
     airlines: list[str] | None,
     via: str | None,
     *,
     strict_airline: bool = True,
 ) -> str | None:
-    """Compose Matrix's RouteLanguage from --airlines + --via.
-
-    Examples:
-        --airlines AIRLINE              -> "AIRLINE+"
-        --via TRANSIT                   -> "TRANSIT"
-        --airlines AIRLINE --via TRANSIT -> "AIRLINE TRANSIT AIRLINE"
-    """
-    al_codes = _resolve_airlines(airlines)
-    suffix = "+" if strict_airline else ""
-    airline_token = None
-    if al_codes:
-        airline_token = (
-            f"{al_codes[0]}{suffix}"
-            if len(al_codes) == 1
-            else f"({'|'.join(al_codes)}){suffix}"
-        )
-
-    via_token = via.strip().upper() if via else None
-
-    if airline_token and via_token:
-        return f"{airline_token} {via_token} {airline_token}"
-    if airline_token:
-        return airline_token
-    if via_token:
-        return via_token
-    return None
-
-
-def _combine_commands(*cmds: str | None) -> str | None:
-    parts = [c for c in cmds if c]
-    return " ".join(parts) if parts else None
+    return build_routing(
+        airlines,
+        via,
+        strict_airline=strict_airline,
+        on_resolved=_log_airline_resolved,
+        on_unresolved=_log_airline_unresolved,
+    )
 
 
 def _validated(parser, *args):
@@ -114,6 +73,19 @@ def _validated(parser, *args):
         return parser(*args)
     except ValueError as exc:
         raise typer.BadParameter(str(exc))
+
+
+@app.command("mcp-config")
+def mcp_config(
+    name: Annotated[str, typer.Option("--name", help="MCP server name in the client config")] = "itamx",
+    command: Annotated[
+        str | None,
+        typer.Option("--command", help="Override the itamx-mcp executable path"),
+    ] = None,
+) -> None:
+    """Print a Claude Desktop compatible MCP server configuration."""
+    executable = command or shutil.which("itamx-mcp") or "itamx-mcp"
+    print(json_module.dumps({"mcpServers": {name: {"command": executable, "args": []}}}, indent=2))
 
 
 @app.command()
@@ -257,37 +229,37 @@ def search(
 
     # Compose slices
     al_list = [a for a in airlines.split(",")] if airlines else None
-    out_routing_final = out_routing or _build_routing(al_list, via)
-    ret_routing_final = ret_routing or _build_routing(al_list, via_back or via)
+    out_routing_final = out_routing or _build_cli_routing(al_list, via)
+    ret_routing_final = ret_routing or _build_cli_routing(al_list, via_back or via)
 
-    out_cmd_final = _combine_commands(
-        _rbd_command(rbd.split(",") if rbd else None), out_cmd
+    out_cmd_final = combine_commands(
+        rbd_command(rbd.split(",") if rbd else None), out_cmd
     )
-    ret_cmd_final = _combine_commands(
-        _rbd_command(rbd.split(",") if rbd else None), ret_cmd
+    ret_cmd_final = combine_commands(
+        rbd_command(rbd.split(",") if rbd else None), ret_cmd
     )
 
-    out_slice = Slice(
-        origin=origin, destination=destination, date=depart,
-        flex_minus=flex, flex_plus=flex,
-        route_language=out_routing_final,
-        command_line=out_cmd_final,
-        time_ranges=_validated(parse_time_ranges, out_time),
+    slices = build_trip_slices(
+        origin=origin,
+        destination=destination,
+        depart=depart,
+        ret=ret,
+        flex=flex,
+        outbound_routing=out_routing_final,
+        return_routing=ret_routing_final,
+        outbound_command=out_cmd_final,
+        return_command=ret_cmd_final,
+        outbound_time_ranges=_validated(parse_time_ranges, out_time),
+        return_time_ranges=_validated(parse_time_ranges, ret_time),
     )
-    slices = [out_slice]
-    if ret:
-        ret_slice = Slice(
-            origin=destination, destination=origin, date=ret,
-            flex_minus=flex, flex_plus=flex,
-            route_language=ret_routing_final,
-            command_line=ret_cmd_final,
-            time_ranges=_validated(parse_time_ranges, ret_time),
-        )
-        slices.append(ret_slice)
 
-    pax = PaxCount(
-        adults=adults, seniors=seniors, youths=youths, children=children,
-        infants_in_seat=infants_seat, infants_in_lap=infants_lap,
+    pax = build_pax_count(
+        adults=adults,
+        seniors=seniors,
+        youths=youths,
+        children=children,
+        infants_seat=infants_seat,
+        infants_lap=infants_lap,
     )
     options = SearchOptions(
         cabin=cabin.upper(),
@@ -541,22 +513,21 @@ def flex(
     )
 
     al_list = [a for a in airlines.split(",")] if airlines else None
-    routing = _build_routing(al_list, via)
+    routing = _build_cli_routing(al_list, via)
     options = SearchOptions(cabin=cabin.upper(), max_stops=max_stops, page_size=20)
 
     def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, str | None]:
-        out_slice = Slice(
-            origin=origin.upper(), destination=destination.upper(), date=dep,
-            route_language=routing,
-            time_ranges=_validated(parse_time_ranges, out_time),
+        slices = build_trip_slices(
+            origin=origin,
+            destination=destination,
+            depart=dep,
+            ret=ret,
+            outbound_routing=routing,
+            return_routing=routing,
+            outbound_time_ranges=_validated(parse_time_ranges, out_time),
+            return_time_ranges=_validated(parse_time_ranges, ret_time),
+            uppercase_codes=True,
         )
-        slices = [out_slice]
-        if ret:
-            slices.append(Slice(
-                origin=destination.upper(), destination=origin.upper(), date=ret,
-                route_language=routing,
-                time_ranges=_validated(parse_time_ranges, ret_time),
-            ))
         try:
             with MatrixClient() as client:
                 resp = client.search(
@@ -709,10 +680,10 @@ def multi(
         o, d, date = parts
         slices.append(Slice(
             origin=o.upper().strip(), destination=d.upper().strip(), date=date.strip(),
-            route_language=_build_routing(al_list, None),
+            route_language=_build_cli_routing(al_list, None),
         ))
 
-    pax = PaxCount(adults=adults)
+    pax = build_pax_count(adults=adults)
     options = SearchOptions(
         cabin=cabin.upper(),
         max_stops=max_stops,
@@ -855,19 +826,17 @@ def show(
     Re-runs the search and expands the rank-th cheapest solution.
     """
     al_list = airlines.split(",") if airlines else None
-    routing = _build_routing(al_list, via)
-    out_slice = Slice(
-        origin=origin, destination=destination, date=depart,
-        route_language=routing,
-        time_ranges=_validated(parse_time_ranges, out_time),
+    routing = _build_cli_routing(al_list, via)
+    slices = build_trip_slices(
+        origin=origin,
+        destination=destination,
+        depart=depart,
+        ret=ret,
+        outbound_routing=routing,
+        return_routing=routing,
+        outbound_time_ranges=_validated(parse_time_ranges, out_time),
+        return_time_ranges=_validated(parse_time_ranges, ret_time),
     )
-    slices = [out_slice]
-    if ret:
-        slices.append(Slice(
-            origin=destination, destination=origin, date=ret,
-            route_language=routing,
-            time_ranges=_validated(parse_time_ranges, ret_time),
-        ))
     options = SearchOptions(cabin=cabin.upper(), page_size=50)
 
     with MatrixClient() as client:

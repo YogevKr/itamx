@@ -149,29 +149,39 @@ def build_search_body(
     summarizers: list[str] | None = None,
     sorts: str = "default",
     change_of_airport: bool = True,
+    currency: str | None = None,
+    sales_city: str | None = None,
 ) -> dict[str, Any]:
     """Build the inner JSON-RPC payload for a Matrix /v1/search call.
 
     `cabin`: COACH, PREMIUM_COACH, BUSINESS, FIRST.
     `max_stops`: number of stops *relative to the route minimum*. 0 = nonstop only,
                  1 = up to 1 extra stop, etc. Matrix calls this maxLegsRelativeToMin.
+    `currency`: ISO 4217 code (e.g. "USD", "ILS"). Overrides Matrix's auto-pick.
+    `sales_city`: IATA code of the point-of-sale city — affects which fares are
+                  offered (some only available from certain origins).
     """
+    inputs: dict[str, Any] = {
+        "filter": {},
+        "page": {"current": 1, "size": page_size},
+        "pax": (pax or PaxCount()).to_payload(),
+        "slices": [s.to_payload() for s in slices],
+        "firstDayOfWeek": "SUNDAY",
+        "internalUser": False,
+        "sliceIndex": 0,
+        "sorts": sorts,
+        "cabin": cabin,
+        "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,
+        "changeOfAirport": change_of_airport,
+        "checkAvailability": True,
+    }
+    if currency:
+        inputs["currency"] = currency
+    if sales_city:
+        inputs["salesCity"] = sales_city
     return {
         "summarizers": summarizers or DEFAULT_SUMMARIZERS,
-        "inputs": {
-            "filter": {},
-            "page": {"current": 1, "size": page_size},
-            "pax": (pax or PaxCount()).to_payload(),
-            "slices": [s.to_payload() for s in slices],
-            "firstDayOfWeek": "SUNDAY",
-            "internalUser": False,
-            "sliceIndex": 0,
-            "sorts": sorts,
-            "cabin": cabin,
-            "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,
-            "changeOfAirport": change_of_airport,
-            "checkAvailability": True,
-        },
+        "inputs": inputs,
         "summarizerSet": "wholeTrip",
         "name": "specificDatesSlice",
     }
@@ -232,8 +242,13 @@ class MatrixClient:
         page_size: int = 50,
         summarizers: list[str] | None = None,
         change_of_airport: bool = True,
+        currency: str | None = None,
+        sales_city: str | None = None,
     ) -> dict[str, Any]:
-        """Run a search. Returns the raw JSON response dict."""
+        """Run a search. Returns the raw JSON response dict.
+
+        `slices` may have any length: 1 (one-way), 2 (round-trip), or 3+ (multi-city).
+        """
         body = build_search_body(
             slices=slices,
             pax=pax,
@@ -242,8 +257,55 @@ class MatrixClient:
             page_size=page_size,
             summarizers=summarizers,
             change_of_airport=change_of_airport,
+            currency=currency,
+            sales_city=sales_city,
         )
         return self._post_batch(body, "/v1/search")
+
+    def lookup_locations(
+        self, partial_name: str, *, page_size: int = 10
+    ) -> list[dict[str, Any]]:
+        """Resolve a partial city/airport name to candidate locations.
+
+        Hits Matrix's autocomplete endpoint:
+            GET /v1/locationTypes/CITIES_AND_AIRPORTS/partialNames/<q>/locations
+
+        Returns a list of dicts with code, displayName, type, cityCode, latLng.
+        """
+        path = (
+            f"/v1/locationTypes/CITIES_AND_AIRPORTS/partialNames/"
+            f"{partial_name}/locations?pageSize={page_size}"
+        )
+        return self._get_batch(path).get("locations", [])
+
+    def _get_batch(self, path: str) -> dict[str, Any]:
+        """GET via the same multipart batch envelope (Matrix uses GET inside multipart for autocomplete)."""
+        boundary = _boundary()
+        body_parts = [
+            f"--{boundary}",
+            "Content-Type: application/http",
+            "Content-Transfer-Encoding: binary",
+            f"Content-ID: <{boundary}+gapiRequest@googleapis.com>",
+            "",
+            f"GET {path}&key={API_KEY}" if "?" in path else f"GET {path}?key={API_KEY}",
+            "x-alkali-application-key: applications/matrix",
+            "x-alkali-auth-apps-namespace: alkali_v2",
+            "x-alkali-auth-entities-namespace: alkali_v2",
+            "X-Requested-With: XMLHttpRequest",
+            "",
+            "",
+            f"--{boundary}--",
+            "",
+        ]
+        multipart = "\r\n".join(body_parts).encode("utf-8")
+        url = f"{BATCH_URL}?%24ct=multipart%2Fmixed%3B%20boundary%3D{boundary}"
+        resp = self._http.post(
+            url,
+            content=multipart,
+            headers={"Content-Type": "text/plain; charset=UTF-8"},
+        )
+        resp.raise_for_status()
+        return _parse_multipart_response(resp.content)
 
     def detail(
         self,

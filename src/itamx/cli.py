@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import concurrent.futures
+import csv as csv_module
 import datetime as dt
 import json as json_module
 import re
+import sys
 from typing import Annotated
 
 import typer
@@ -240,7 +242,7 @@ def search(
         int, typer.Option("--limit", help="Max solutions to return", min=1, max=500)
     ] = 50,
     output: Annotated[
-        str, typer.Option("--output", "-o", help="text | json | raw")
+        str, typer.Option("--output", "-o", help="text | json | csv | raw")
     ] = "text",
     top: Annotated[int, typer.Option("--top", help="Rows to show in text mode")] = 15,
     detail: Annotated[
@@ -251,6 +253,17 @@ def search(
             min=0, max=20,
         ),
     ] = 0,
+    currency: Annotated[
+        str | None,
+        typer.Option("--currency", help="ISO 4217 code, e.g. USD or ILS"),
+    ] = None,
+    sales_city: Annotated[
+        str | None,
+        typer.Option(
+            "--sales-city",
+            help="IATA city code for point-of-sale (affects fare offers)",
+        ),
+    ] = None,
 ) -> None:
     """Search flights. Returns a price-sorted table with optional fare-class detail."""
     origin = origin.upper()
@@ -299,6 +312,8 @@ def search(
                 cabin=cabin.upper(),
                 max_stops=max_stops,
                 page_size=page_size,
+                currency=currency,
+                sales_city=sales_city,
             )
         except Exception as e:
             console.print(f"[red]Search failed: {e}[/red]")
@@ -339,6 +354,35 @@ def search(
             "details": {sid: d for sid, d in details_by_id.items()} or None,
         }
         print(json_module.dumps(out, indent=2, default=str))
+        return
+
+    if output == "csv":
+        writer = csv_module.writer(sys.stdout)
+        header = ["price", "carriers", "out_dep", "out_route", "out_flights", "out_dur_min",
+                  "ret_dep", "ret_route", "ret_flights", "ret_dur_min", "total_dur_min"]
+        if details_by_id:
+            header.append("rbd")
+        writer.writerow(header)
+        for sol in solutions[:top]:
+            slices_o = sol.itinerary.slices
+            o = slices_o[0] if slices_o else None
+            r = slices_o[1] if len(slices_o) > 1 else None
+            row = [
+                sol.displayTotal,
+                "/".join(c.code for c in sol.itinerary.carriers),
+                o.departure if o else "",
+                f"{o.origin.code}->{o.destination.code}" if o else "",
+                "/".join(o.flights) if o else "",
+                o.duration if o else "",
+                r.departure if r else "",
+                f"{r.origin.code}->{r.destination.code}" if r else "",
+                "/".join(r.flights) if r else "",
+                r.duration if r else "",
+                sum(s.duration for s in slices_o),
+            ]
+            if details_by_id:
+                row.append(_extract_rbd(details_by_id.get(sol.id)))
+            writer.writerow(row)
         return
 
     if parsed.carrierStopMatrix and parsed.carrierStopMatrix.columns:
@@ -523,6 +567,154 @@ def flex(
     for dep, ret, price, disp, car in rows:
         wkday = dt.date.fromisoformat(dep).strftime("%a")
         table.add_row(dep, ret or "—", wkday, disp or "—", car or "—")
+    console.print(table)
+
+
+@app.command()
+def lookup(
+    query: Annotated[str, typer.Argument(help="Partial city or airport name or IATA code")],
+    limit: Annotated[int, typer.Option("--limit", min=1, max=50)] = 10,
+    output: Annotated[str, typer.Option("--output", "-o")] = "text",
+) -> None:
+    """Resolve city/airport names. Useful when you don't know the IATA code."""
+    with MatrixClient() as client:
+        try:
+            locations = client.lookup_locations(query, page_size=limit)
+        except Exception as e:
+            console.print(f"[red]Lookup failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    if output == "json":
+        print(json_module.dumps(locations, indent=2))
+        return
+
+    if not locations:
+        console.print(f"[yellow]No locations matched {query!r}[/yellow]")
+        return
+
+    table = Table(title=f"Locations matching {query!r}")
+    table.add_column("Code")
+    table.add_column("Type")
+    table.add_column("Name")
+    table.add_column("City")
+    for loc in locations:
+        table.add_row(
+            loc.get("code", "?"),
+            loc.get("type", ""),
+            loc.get("displayName", ""),
+            loc.get("cityName", ""),
+        )
+    console.print(table)
+
+
+@app.command()
+def multi(
+    leg: Annotated[
+        list[str],
+        typer.Option(
+            "--leg", "-l",
+            help="A leg as SOURCE:DESTINATION:DATE. Pass once per leg.",
+        ),
+    ],
+    cabin: Annotated[str, typer.Option("--cabin", "-c")] = "COACH",
+    adults: Annotated[int, typer.Option("--adults", min=1, max=9)] = 1,
+    max_stops: Annotated[int | None, typer.Option("--max-stops", "-s", min=0)] = None,
+    airlines: Annotated[str | None, typer.Option("--airlines", "-a")] = None,
+    currency: Annotated[str | None, typer.Option("--currency")] = None,
+    sales_city: Annotated[str | None, typer.Option("--sales-city")] = None,
+    detail: Annotated[int, typer.Option("--detail", "-d", min=0, max=20)] = 0,
+    top: Annotated[int, typer.Option("--top")] = 10,
+    output: Annotated[str, typer.Option("--output", "-o")] = "text",
+) -> None:
+    """Multi-city / open-jaw search. Pass `--leg SOURCE:DESTINATION:DATE` 2+ times.
+
+    Example:
+        itamx multi -l SOURCE:STOPOVER:LEG1_DATE -l STOPOVER:DESTINATION:LEG2_DATE -l DESTINATION:SOURCE:LEG3_DATE
+    """
+    if len(leg) < 2:
+        raise typer.BadParameter("Need at least 2 legs (use --leg multiple times)")
+
+    al_list = [a for a in airlines.split(",")] if airlines else None
+    slices: list[Slice] = []
+    for spec in leg:
+        parts = spec.split(":")
+        if len(parts) != 3:
+            raise typer.BadParameter(f"--leg must be SOURCE:DESTINATION:DATE (got {spec!r})")
+        o, d, date = parts
+        slices.append(Slice(
+            origin=o.upper().strip(), destination=d.upper().strip(), date=date.strip(),
+            route_language=_build_routing(al_list, None),
+        ))
+
+    pax = PaxCount(adults=adults)
+    with MatrixClient() as client:
+        try:
+            raw = client.search(
+                slices=slices, pax=pax, cabin=cabin.upper(),
+                max_stops=max_stops, page_size=50,
+                currency=currency, sales_city=sales_city,
+            )
+        except Exception as e:
+            console.print(f"[red]Search failed: {e}[/red]")
+            raise typer.Exit(1)
+
+        details_by_id: dict[str, dict] = {}
+        if detail > 0:
+            sols = sorted(
+                raw.get("solutionList", {}).get("solutions", []),
+                key=lambda s: _price_float(s.get("displayTotal")) or float("inf"),
+            )[:detail]
+            for sol in sols:
+                sid = sol.get("id")
+                if not sid:
+                    continue
+                try:
+                    d = client.detail(raw, sid, slices, pax=pax, cabin=cabin.upper())
+                    details_by_id[sid] = d.get("bookingDetails", {})
+                except Exception as e:
+                    details_by_id[sid] = {"error": str(e)}
+
+    if output == "raw":
+        print(json_module.dumps(raw, indent=2))
+        return
+
+    parsed = SearchResponse.model_validate(raw)
+    sols = sorted(
+        parsed.solutionList.solutions,
+        key=lambda s: _price_float(s.displayTotal) or float("inf"),
+    )
+
+    if output == "json":
+        print(json_module.dumps([s.model_dump(mode="json") for s in sols], indent=2, default=str))
+        return
+
+    if not sols:
+        console.print("[yellow]No solutions returned[/yellow]")
+        return
+
+    table = Table(title=f"Multi-city: {' → '.join(s.origin + '→' + s.destination for s in slices)}")
+    table.add_column("Price", justify="right")
+    table.add_column("Carriers")
+    for i in range(len(slices)):
+        table.add_column(f"Leg {i+1}")
+    table.add_column("Total dur")
+    if details_by_id:
+        table.add_column("RBD")
+
+    for sol in sols[:top]:
+        cells = [sol.displayTotal, "/".join(c.code for c in sol.itinerary.carriers)]
+        for s in sol.itinerary.slices:
+            cells.append(
+                f"{_format_time(s.departure)} {s.origin.code}→{s.destination.code} "
+                f"({'/'.join(s.flights)}, {_format_duration(s.duration)})"
+            )
+        # Pad if Matrix returned fewer slices than we asked
+        while len(cells) - 2 < len(slices):
+            cells.append("?")
+        cells.append(_format_duration(sum(s.duration for s in sol.itinerary.slices)))
+        if details_by_id:
+            cells.append(_extract_rbd(details_by_id.get(sol.id)))
+        table.add_row(*cells)
     console.print(table)
 
 

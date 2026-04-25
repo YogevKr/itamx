@@ -7,11 +7,6 @@ return canned JSON shaped like real responses.
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
-import unittest.mock as mock
-
 import pytest
 
 

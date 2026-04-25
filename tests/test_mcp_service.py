@@ -2,9 +2,11 @@ import unittest
 
 from itamx.mcp.service import (
     DateSearchParams,
+    FlightDetailParams,
     FlightSearchParams,
     LookupParams,
     _execute_date_search,
+    _execute_flight_detail,
     _execute_flight_search,
     _execute_location_lookup,
 )
@@ -13,6 +15,8 @@ from itamx.mcp.service import (
 def _raw_response(price: str = "USD123.45", date: str = "2099-01-01") -> dict:
     return {
         "solutionCount": 1,
+        "solutionSet": "fixture-set",
+        "session": "fixture-session",
         "solutionList": {
             "solutions": [
                 {
@@ -40,6 +44,7 @@ def _raw_response(price: str = "USD123.45", date: str = "2099-01-01") -> dict:
 
 class FakeMatrixClient:
     def __init__(self) -> None:
+        self.detail_calls = []
         self.search_calls = []
         self.lookup_calls = []
 
@@ -57,6 +62,48 @@ class FakeMatrixClient:
     def lookup_locations(self, query: str, *, page_size: int):
         self.lookup_calls.append({"query": query, "page_size": page_size})
         return [{"code": "SRC", "displayName": query}]
+
+    def detail(self, search_response, solution_id, slices, *, pax=None, **kwargs):
+        self.detail_calls.append(
+            {
+                "search_response": search_response,
+                "solution_id": solution_id,
+                "slices": slices,
+                "pax": pax,
+                "kwargs": kwargs,
+            }
+        )
+        return {
+            "bookingDetails": {
+                "itinerary": {
+                    "slices": [
+                        {
+                            "origin": {"code": "SRC"},
+                            "destination": {"code": "DST"},
+                            "departure": "2099-01-01T08:00:00",
+                            "arrival": "2099-01-01T10:00:00",
+                            "segments": [
+                                {
+                                    "carrier": {"code": "ZZ"},
+                                    "flight": {"number": "1"},
+                                    "origin": {"code": "SRC"},
+                                    "destination": {"code": "DST"},
+                                    "departure": "2099-01-01T08:00:00",
+                                    "arrival": "2099-01-01T10:00:00",
+                                    "duration": 120,
+                                    "bookingInfos": [
+                                        {"bookingCode": "Y", "cabin": "COACH"},
+                                    ],
+                                    "legs": [
+                                        {"aircraft": {"shortName": "Test Jet"}},
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
 
 
 class MCPServiceTests(unittest.TestCase):
@@ -129,6 +176,30 @@ class MCPServiceTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(created[0].lookup_calls[0]["page_size"], 7)
         self.assertEqual(result["locations"][0]["code"], "SRC")
+
+    def test_flight_detail_fetches_booking_details(self) -> None:
+        created = []
+
+        def factory():
+            client = FakeMatrixClient()
+            created.append(client)
+            return client
+
+        result = _execute_flight_detail(
+            FlightDetailParams(
+                source="SRC",
+                destination="DST",
+                depart_date="2099-01-01",
+                rank=1,
+            ),
+            client_factory=factory,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["solution"]["id"], "solution-1")
+        self.assertEqual(result["detail"]["slices"][0]["segments"][0]["booking_codes"], ["Y"])
+        self.assertEqual(result["detail"]["slices"][0]["segments"][0]["aircraft"], "Test Jet")
+        self.assertEqual(created[0].detail_calls[0]["solution_id"], "solution-1")
 
     def test_invalid_sort_is_reported_as_tool_error(self) -> None:
         result = _execute_flight_search(

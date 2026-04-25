@@ -49,6 +49,7 @@ jobs:
               tools = [tool.name for tool in await mcp.list_tools()]
               assert tools == [
                   "search_flights",
+                  "show_flight_details",
                   "search_dates",
                   "search_locations",
                   "search_airlines",

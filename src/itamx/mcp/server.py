@@ -12,10 +12,12 @@ from pydantic import Field
 from itamx.mcp.service import (
     AirlineLookupParams,
     DateSearchParams,
+    FlightDetailParams,
     FlightSearchParams,
     LookupParams,
     _execute_airline_lookup,
     _execute_date_search,
+    _execute_flight_detail,
     _execute_flight_search,
     _execute_location_lookup,
 )
@@ -82,6 +84,73 @@ def search_flights(
             sales_city=sales_city,
             sort=sort,
             limit=limit,
+        )
+    )
+
+
+@mcp.tool(
+    annotations={"title": "Show Flight Details", "readOnlyHint": True, "idempotentHint": True}
+)
+def show_flight_details(
+    source: Annotated[str, Field(description="Source IATA city or airport code")],
+    destination: Annotated[str, Field(description="Destination IATA city or airport code")],
+    depart_date: Annotated[str, Field(description="Outbound date in YYYY-MM-DD format")],
+    return_date: Annotated[
+        str | None,
+        Field(description="Optional return date in YYYY-MM-DD format"),
+    ] = None,
+    rank: Annotated[
+        int,
+        Field(description="Rank to expand after applying the requested sort", ge=1),
+    ] = 1,
+    cabin: Annotated[str, Field(description="COACH, PREMIUM_COACH, BUSINESS, or FIRST")] = "COACH",
+    max_stops: Annotated[
+        int | None,
+        Field(description="Max stops relative to route minimum; 0 requests nonstop", ge=0),
+    ] = None,
+    airlines: Annotated[
+        list[str] | None,
+        Field(description="Airline IATA codes or carrier names"),
+    ] = None,
+    via: Annotated[
+        str | None,
+        Field(description="Transit airport to route through in both directions"),
+    ] = None,
+    outbound_time: Annotated[
+        str | None,
+        Field(description="Outbound departure window, e.g. '6-12' or '0-6,18-23'"),
+    ] = None,
+    return_time: Annotated[
+        str | None,
+        Field(description="Return departure window, e.g. '18-24'"),
+    ] = None,
+    adults: Annotated[int, Field(description="Adult passengers", ge=1, le=9)] = 1,
+    currency: Annotated[str | None, Field(description="ISO 4217 currency code")] = None,
+    sales_city: Annotated[str | None, Field(description="IATA city code for point of sale")] = None,
+    sort: Annotated[
+        str,
+        Field(description="default, price, duration, departureTime, or arrivalTime"),
+    ] = "price",
+) -> dict[str, Any]:
+    """Search and expand one Matrix solution with segment, aircraft, and RBD details."""
+    return _execute_flight_detail(
+        FlightDetailParams(
+            source=source,
+            destination=destination,
+            depart_date=depart_date,
+            return_date=return_date,
+            rank=rank,
+            cabin=cabin,
+            max_stops=max_stops,
+            airlines=airlines,
+            via=via,
+            outbound_time=outbound_time,
+            return_time=return_time,
+            adults=adults,
+            currency=currency,
+            sales_city=sales_city,
+            sort=sort,
+            limit=max(rank, 1),
         )
     )
 
@@ -168,7 +237,13 @@ def configuration_resource() -> str:
     """Expose tool names and input conventions."""
     return json.dumps(
         {
-            "tools": ["search_flights", "search_dates", "search_locations", "search_airlines"],
+            "tools": [
+                "search_flights",
+                "show_flight_details",
+                "search_dates",
+                "search_locations",
+                "search_airlines",
+            ],
             "date_format": "YYYY-MM-DD",
             "code_inputs": "Use IATA city or airport codes; comma-separated codes are accepted by search tools.",
             "http_endpoint": "http://127.0.0.1:8000/mcp/",

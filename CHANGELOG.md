@@ -7,6 +7,8 @@
 - Added shared Matrix request-building helpers used by both CLI and MCP.
 - Added sanitized response fixture tests.
 - Replaced the starter package `hello()` with real public exports and version metadata.
+- Added core flight service functions and `show_flight_details` MCP tool.
+- Added opt-in live smoke tests for Matrix lookup, search, and detail endpoints.
 
 ## 0.2.0
 

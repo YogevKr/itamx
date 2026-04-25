@@ -157,6 +157,7 @@ Available tools:
 | Tool | Purpose |
 |---|---|
 | `search_flights` | Search one-way or round-trip Matrix fares |
+| `show_flight_details` | Expand one priced solution into segment, aircraft, and fare-class detail |
 | `search_dates` | Scan a departure-date range and return cheapest date results |
 | `search_locations` | Autocomplete Matrix city and airport locations |
 | `search_airlines` | Resolve airline names and codes |
@@ -204,6 +205,8 @@ The complete public surface:
 | `itamx.client.Slice` | Trip leg dataclass — source/destination/date + filters |
 | `itamx.client.PaxCount` | Passenger breakdown |
 | `itamx.client.build_search_body` | Compose a search payload without sending it (for inspection / replay) |
+| `itamx.core.execute_flight_search` | Shared search service used by adapters |
+| `itamx.core.execute_flight_detail` | Shared search+detail service with segment/RBD output |
 | `itamx.airlines.search(query)` | Substring search, returns ranked list of airline dicts |
 | `itamx.airlines.resolve(token)` | Best-effort IATA resolver, returns code or `None` if ambiguous |
 | `itamx.airlines.by_iata(code)` | Direct lookup |
@@ -238,10 +241,22 @@ the QPX engine):
 
 ## Known limits
 
+- `itamx` is not affiliated with Google, ITA Software, or ITA Matrix.
 - Matrix rate limits are undocumented; if Google starts requiring the
   `bgProgramResponse` (WAA) token, we'll need to add token handling.
 - Time windows that wrap midnight (e.g. 22:00–02:00) need to be expressed as
   two ranges (`--out-time 22-23,0-2`).
+
+## Live smoke tests
+
+CI uses fixtures only. To check the live Matrix API locally:
+
+```bash
+ITAMX_LIVE=1 uv run python -m unittest tests.test_live_smoke
+```
+
+These tests hit Matrix lookup, search, and detail endpoints and may fail if the
+remote service rate-limits or changes response format.
 
 ## Re-capturing the API spec
 

@@ -7,6 +7,7 @@ Importing this package without the extra keeps the regular CLI usable.
 try:
     from itamx.mcp.server import (
         DateSearchParams,
+        FlightDetailParams,
         FlightSearchParams,
         LookupParams,
         mcp,
@@ -16,10 +17,12 @@ try:
         search_dates,
         search_flights,
         search_locations,
+        show_flight_details,
     )
 
     __all__ = [
         "DateSearchParams",
+        "FlightDetailParams",
         "FlightSearchParams",
         "LookupParams",
         "mcp",
@@ -29,6 +32,7 @@ try:
         "search_dates",
         "search_flights",
         "search_locations",
+        "show_flight_details",
     ]
 except ModuleNotFoundError:
     __all__: list[str] = []

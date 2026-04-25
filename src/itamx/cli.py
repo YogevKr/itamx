@@ -336,6 +336,14 @@ def search(
                  "Y/W/J availability per outbound flight. ~3× slower (2 extra searches).",
         ),
     ] = False,
+    flight: Annotated[
+        str | None,
+        typer.Option(
+            "--flight",
+            help="Restrict results to itineraries containing these flight numbers "
+                 "(comma-separated, e.g. LY5 or LY5,LY10). Post-filter, AND across the list.",
+        ),
+    ] = None,
 ) -> None:
     """Search flights. Returns a price-sorted table with optional fare-class detail.
 
@@ -477,6 +485,18 @@ def search(
             s for s in solutions
             if sum(sl.duration for sl in s.itinerary.slices) <= max_min
         ]
+
+    # --flight filter: keep solutions whose union of slice-flights covers all
+    # requested flight numbers. Comma-list, AND semantics (all must appear).
+    if flight:
+        wanted = {f.strip().upper() for f in flight.split(",") if f.strip()}
+        def _flights_in(sol) -> set[str]:
+            return {f for sl in sol.itinerary.slices for f in (sl.flights or [])}
+        solutions = [s for s in solutions if wanted.issubset(_flights_in(s))]
+        if not solutions:
+            err_console.print(
+                f"[yellow]No solutions contain all of {sorted(wanted)} (post-filter).[/yellow]"
+            )
 
     if output == SearchOutput.json:
         # Strip down to the most useful structured fields
@@ -1129,6 +1149,13 @@ def show(
                  "segment with cabin availability + sub-fleet hint.",
         ),
     ] = False,
+    flight: Annotated[
+        str | None,
+        typer.Option(
+            "--flight",
+            help="Only consider itineraries containing these flight numbers (comma-list).",
+        ),
+    ] = None,
     output: Annotated[
         ShowOutput, typer.Option("--output", "-o", help="Output format")
     ] = ShowOutput.text,
@@ -1162,6 +1189,15 @@ def show(
             raw.get("solutionList", {}).get("solutions", []),
             key=lambda s: price_float(s.get("displayTotal")) or float("inf"),
         )
+        if flight:
+            wanted = {f.strip().upper() for f in flight.split(",") if f.strip()}
+            def _flights_in_sol(sol: dict) -> set[str]:
+                return {
+                    f for sl in sol.get("itinerary", {}).get("slices", [])
+                    for f in (sl.get("flights") or [])
+                }
+            sols = [s for s in sols if wanted.issubset(_flights_in_sol(s))]
+
         if not sols:
             console.print("[yellow]No solutions returned[/yellow]")
             raise typer.Exit(0)

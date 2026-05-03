@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from typer.testing import CliRunner
 
@@ -140,11 +141,52 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("sort", result.output)
         self.assertIn("bogus", result.output)
 
-    def test_flex_does_not_allow_return_past_end_date(self) -> None:
+    def test_flex_treats_window_as_depart_range(self) -> None:
+        # Regression: previously rejected because Apr 1 + 7 days = May 8 > end.
+        # New semantics: [start, end] is the depart window, return extends freely.
+        # 3 depart dates × 1 duration = 3 candidates.
+        with mock.patch.object(MatrixClient, "search", return_value={"solutionList": {"solutions": []}}):
+            result = runner.invoke(
+                app,
+                ["flex", "TLV", "SFO", "2026-05-01", "2026-05-03",
+                 "--duration", "7", "--output", "json"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Searching 3 (depart, return)", result.output)
+
+    def test_flex_rectangular_sweep_with_ret_window(self) -> None:
+        # 2 depart × 3 return = 6 candidates.
+        with mock.patch.object(MatrixClient, "search", return_value={"solutionList": {"solutions": []}}):
+            result = runner.invoke(
+                app,
+                ["flex", "TLV", "SFO", "2026-05-01", "2026-05-02",
+                 "--ret-start", "2026-05-15", "--ret-end", "2026-05-17",
+                 "--output", "json"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Searching 6 (depart, return)", result.output)
+
+    def test_flex_rectangular_sweep_filters_by_stay(self) -> None:
+        # 2 depart × 3 return = 6 raw, but --stay 14 keeps only depart+14 == return:
+        # (2026-05-01, 2026-05-15) and (2026-05-02, 2026-05-16).
+        with mock.patch.object(MatrixClient, "search", return_value={"solutionList": {"solutions": []}}):
+            result = runner.invoke(
+                app,
+                ["flex", "TLV", "SFO", "2026-05-01", "2026-05-02",
+                 "--ret-start", "2026-05-15", "--ret-end", "2026-05-17",
+                 "--stay", "14", "--output", "json"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Searching 2 (depart, return)", result.output)
+
+    def test_flex_ret_window_requires_both_endpoints(self) -> None:
         result = runner.invoke(
             app,
-            ["flex", "TLV", "SFO", "2026-05-01", "2026-05-03", "--duration", "7"],
+            ["flex", "TLV", "SFO", "2026-05-01", "2026-05-03",
+             "--ret-start", "2026-05-15"],
         )
-
-        self.assertEqual(result.exit_code, 1)
-        self.assertIn("No candidate dates", result.output)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--ret-start and --ret-end must be used together", result.output)

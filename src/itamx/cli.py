@@ -90,6 +90,7 @@ def _diagnose_empty_search(
     out_time: str | None,
     flight: str | None,
     aircraft: str | None = None,
+    flex: int = 0,
 ) -> list[str]:
     """Return a list of human-readable hints for why a search returned 0 results.
 
@@ -147,6 +148,12 @@ def _diagnose_empty_search(
         likely.append(
             f"--out-routing/--via {out_routing!r}: forced routing may be too restrictive"
         )
+        if flex > 0:
+            likely.append(
+                "--flex combined with airline/routing constraints often returns 0 from "
+                "Matrix's date-modifier even when each filter works alone. Try `itamx flex` "
+                "for a per-date sweep that filters in-process instead."
+            )
     if out_cmd:
         likely.append(
             f"--out-cmd {out_cmd!r}: command-line filter may be excluding all options"
@@ -708,7 +715,7 @@ def search(
                 depart=depart, ret=ret, cabin=cabin,
                 max_stops=max_stops, out_routing=out_routing_final,
                 out_cmd=out_cmd_final, out_time=out_time, flight=flight,
-                aircraft=aircraft,
+                aircraft=aircraft, flex=flex,
             ):
                 console.print(f"[dim]  {h}[/dim]")
         return
@@ -812,6 +819,21 @@ def flex(
             help="Range of trip lengths in days, e.g. '5-8' searches 5/6/7/8-night stays. Overrides --duration.",
         ),
     ] = None,
+    ret_start: Annotated[
+        str | None,
+        typer.Option(
+            "--ret-start",
+            help="Earliest possible return YYYY-MM-DD. With --ret-end, runs a rectangular "
+                 "depart × return sweep instead of computing return from --duration/--stay.",
+        ),
+    ] = None,
+    ret_end: Annotated[
+        str | None,
+        typer.Option(
+            "--ret-end",
+            help="Latest possible return YYYY-MM-DD. Pair with --ret-start.",
+        ),
+    ] = None,
     days: Annotated[
         str,
         typer.Option(
@@ -842,8 +864,14 @@ def flex(
 ) -> None:
     """Find the cheapest week in a date range. One Matrix search per candidate departure date.
 
-    For round-trip: searches every depart in [start..end-duration] and pairs with depart+duration.
-    Use --days SUN,MON to filter to specific weekdays (helpful for "find cheapest Sun-Sat in May").
+    [start..end] is the depart window. Return is computed as depart + --duration
+    (or each value in --stay), and may extend past `end`.
+
+    Pass --ret-start/--ret-end to run a rectangular depart × return sweep instead.
+    With --stay, only pairs whose stay length falls in the range are kept.
+
+    Use --days SUN,MON to filter departure weekdays (helpful for "find cheapest
+    Sun-Sat in May").
     """
     try:
         d_start = dt.date.fromisoformat(start)
@@ -853,6 +881,18 @@ def flex(
     if d_end < d_start:
         raise typer.BadParameter("end is before start")
 
+    if (ret_start is None) != (ret_end is None):
+        raise typer.BadParameter("--ret-start and --ret-end must be used together")
+    d_ret_start = d_ret_end = None
+    if ret_start and ret_end:
+        try:
+            d_ret_start = dt.date.fromisoformat(ret_start)
+            d_ret_end = dt.date.fromisoformat(ret_end)
+        except ValueError as e:
+            raise typer.BadParameter(f"Bad return-window date: {e}")
+        if d_ret_end < d_ret_start:
+            raise typer.BadParameter("--ret-end is before --ret-start")
+
     weekday_filter = _validated(parse_weekdays, days)
 
     # Determine trip lengths to try
@@ -861,20 +901,32 @@ def flex(
     else:
         durations_to_try = [duration]
 
-    # Build candidate departure dates × trip lengths
+    # Build candidate (depart, return) pairs.
     candidates: list[tuple[str, str | None]] = []
     cur = d_start
     while cur <= d_end:
         if weekday_filter and cur.weekday() not in weekday_filter:
             cur += dt.timedelta(days=1)
             continue
-        for dur_days in durations_to_try:
-            if dur_days > 0 and cur + dt.timedelta(days=dur_days) > d_end:
-                continue
-            ret_date = (
-                (cur + dt.timedelta(days=dur_days)).isoformat() if dur_days > 0 else None
-            )
-            candidates.append((cur.isoformat(), ret_date))
+        if d_ret_start is not None and d_ret_end is not None:
+            # Rectangular sweep over an explicit return window.
+            r = d_ret_start
+            while r <= d_ret_end:
+                stay_days = (r - cur).days
+                if stay_days <= 0:
+                    r += dt.timedelta(days=1)
+                    continue
+                if stay and stay_days not in durations_to_try:
+                    r += dt.timedelta(days=1)
+                    continue
+                candidates.append((cur.isoformat(), r.isoformat()))
+                r += dt.timedelta(days=1)
+        else:
+            for dur_days in durations_to_try:
+                ret_date = (
+                    (cur + dt.timedelta(days=dur_days)).isoformat() if dur_days > 0 else None
+                )
+                candidates.append((cur.isoformat(), ret_date))
         cur += dt.timedelta(days=1)
 
     if not candidates:

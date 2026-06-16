@@ -5,9 +5,12 @@ from __future__ import annotations
 import concurrent.futures
 import csv as csv_module
 import datetime as dt
+import getpass
 import json as json_module
 import shutil
 import sys
+import time
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -18,6 +21,19 @@ from itamx import airlines as airline_db
 from itamx import fleet_hints
 from itamx.client import MatrixClient, Slice
 from itamx.client import _normalize_cabin as _client_normalize_cabin
+from itamx.elal import (
+    ElAlAwardAuthError,
+    ElAlAwardClient,
+    ElAlPaxCount,
+    bootstrap_elal_session_from_sso,
+    extract_elal_award_headers_from_har,
+    load_elal_credentials,
+    load_elal_session,
+    login_with_elal_browser,
+    login_with_elal_credentials,
+    save_elal_credentials,
+    save_elal_session,
+)
 from itamx.models import SearchResponse
 from itamx.request_options import SearchOptions
 from itamx.render import extract_rbd, format_duration, format_time, price_float
@@ -1640,6 +1656,661 @@ def show(
             )
             prev_arr = seg_arr
         console.print()
+
+
+def _format_elal_points(value) -> str:
+    if value is None:
+        return "-"
+    return f"{float(value):,.0f}"
+
+
+def _format_elal_money(amount, currency) -> str:
+    if amount is None:
+        return "-"
+    if currency:
+        return f"{currency}{float(amount):.2f}"
+    return f"{float(amount):.2f}"
+
+
+_ELAL_SAVER_BUCKETS = {
+    ("COACH", "E"): "coach",
+    ("PREMIUM_COACH", "A"): "premium",
+    ("BUSINESS", "X"): "business",
+}
+
+
+def _parse_iso_date_arg(value: str, name: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be YYYY-MM-DD") from exc
+
+
+def _elal_aircraft(row: dict) -> str:
+    aircraft = sorted(
+        {str(segment.get("aircraft")) for segment in row.get("segments") or [] if segment.get("aircraft")}
+    )
+    return ",".join(aircraft)
+
+
+def _elal_saver_class(row: dict) -> str | None:
+    cabin = str(row.get("cabin") or "").upper()
+    rbd = str(row.get("rbd") or "").upper()
+    return _ELAL_SAVER_BUCKETS.get((cabin, rbd))
+
+
+def _elal_saver_record(date: dt.date, row: dict) -> dict:
+    return {
+        "date": date.isoformat(),
+        "award_class": _elal_saver_class(row),
+        "rbd": row.get("rbd"),
+        "flight": " ".join(row.get("flights") or []),
+        "origin": row.get("origin"),
+        "destination": row.get("destination"),
+        "departure": row.get("departure"),
+        "arrival": row.get("arrival"),
+        "cabin": row.get("cabin"),
+        "points": row.get("points"),
+        "tax_amount": row.get("tax_amount"),
+        "tax_currency": row.get("tax_currency"),
+        "seats_left": row.get("seats_left"),
+        "aircraft": _elal_aircraft(row),
+    }
+
+
+def _elal_header(headers: dict[str, str], name: str) -> str | None:
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+@app.command(name="elal-login")
+def elal_login(
+    username: Annotated[
+        str | None,
+        typer.Option(
+            "--username",
+            envvar="ITAMX_ELAL_USERNAME",
+            help="Matmid username/member/email for SSO credential login",
+        ),
+    ] = None,
+    password: Annotated[
+        str | None,
+        typer.Option(
+            "--password",
+            envvar="ITAMX_ELAL_PASSWORD",
+            help="Matmid password; prompts when --username is set and this is omitted",
+        ),
+    ] = None,
+    matmid_cookie: Annotated[
+        str | None,
+        typer.Option(
+            "--matmid-cookie",
+            help="Cookie header from an already logged-in matmid.elal.com browser session",
+        ),
+    ] = None,
+    cookie: Annotated[
+        str | None,
+        typer.Option("--cookie", help="Existing booking.elal.com Cookie header"),
+    ] = None,
+    authorization: Annotated[
+        str | None,
+        typer.Option("--authorization", help="Existing booking Authorization header"),
+    ] = None,
+    import_har: Annotated[
+        Path | None,
+        typer.Option("--import-har", help="One-time import from a captured EL AL points HAR"),
+    ] = None,
+    credentials_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--credentials-file",
+            help="Matmid username/password JSON file",
+        ),
+    ] = None,
+    save_credentials: Annotated[
+        bool,
+        typer.Option(
+            "--save-credentials",
+            help="Save provided username/password to the credentials file",
+        ),
+    ] = False,
+    session_file: Annotated[
+        Path | None,
+        typer.Option("--session-file", help="Where to save the reusable EL AL session"),
+    ] = None,
+    market: Annotated[str, typer.Option("--market", help="EL AL market code")] = "IL",
+    language: Annotated[str, typer.Option("--language", help="EL AL content language")] = "he",
+) -> None:
+    """Create or save an EL AL booking session for later award searches."""
+    try:
+        credentials_saved = None
+        if not username and not password:
+            credentials = load_elal_credentials(credentials_file)
+            if credentials:
+                username = credentials.username
+                password = credentials.password
+
+        if username or password:
+            if not username:
+                raise ValueError("Provide --username with --password")
+            if not password:
+                password = getpass.getpass("EL AL password: ")
+            if save_credentials:
+                credentials_saved = save_elal_credentials(
+                    username=username,
+                    password=password,
+                    path=credentials_file,
+                )
+            headers = login_with_elal_credentials(
+                username=username,
+                password=password,
+                booking_cookie=cookie,
+                market=market,
+                language=language,
+            )
+            source = "credentials"
+        elif matmid_cookie:
+            headers = bootstrap_elal_session_from_sso(
+                matmid_cookie=matmid_cookie,
+                booking_cookie=cookie,
+                market=market,
+                language=language,
+            )
+            source = "matmid-sso"
+        elif import_har:
+            headers = extract_elal_award_headers_from_har(import_har)
+            source = "har-import"
+        else:
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+            if cookie:
+                headers["Cookie"] = cookie
+            if not headers:
+                existing = load_elal_session(session_file)
+                if existing:
+                    headers = existing.headers
+                    source = "existing-session"
+                else:
+                    raise ValueError(
+                        "Provide --username, --matmid-cookie, --cookie/--authorization, "
+                        "or --import-har"
+                    )
+            else:
+                source = "manual"
+
+        cookie_header = _elal_header(headers, "Cookie")
+        auth_header = _elal_header(headers, "Authorization")
+        if not auth_header and cookie_header:
+            with ElAlAwardClient(
+                cookie=cookie_header,
+                language=language,
+                market=market,
+                use_session_file=False,
+            ) as client:
+                headers = {
+                    "Cookie": client._http.headers["Cookie"],
+                    "Authorization": client._http.headers["Authorization"],
+                    "User-Agent": client._http.headers["User-Agent"],
+                }
+
+        saved = save_elal_session(headers, session_file, source=source)
+    except (ElAlAwardAuthError, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"Saved EL AL session to [bold]{saved}[/bold]")
+    if credentials_saved:
+        console.print(f"Saved EL AL credentials to [bold]{credentials_saved}[/bold]")
+
+
+@app.command(name="elal-browser-login")
+def elal_browser_login(
+    method: Annotated[
+        str,
+        typer.Option(
+            "--method",
+            help="manual, password, or sms. Manual lets you complete login in Chrome.",
+        ),
+    ] = "manual",
+    phone: Annotated[
+        str | None,
+        typer.Option(
+            "--phone",
+            envvar="ITAMX_ELAL_PHONE",
+            help="Mobile number for --method sms",
+        ),
+    ] = None,
+    credentials_file: Annotated[
+        Path | None,
+        typer.Option("--credentials-file", help="Matmid username/password JSON file"),
+    ] = None,
+    session_file: Annotated[
+        Path | None,
+        typer.Option("--session-file", help="Where to save the reusable EL AL session"),
+    ] = None,
+    cdp_url: Annotated[
+        str | None,
+        typer.Option(
+            "--cdp-url",
+            help="Attach to an existing Chrome DevTools endpoint, e.g. http://127.0.0.1:9222",
+        ),
+    ] = None,
+    profile_dir: Annotated[
+        Path | None,
+        typer.Option("--profile-dir", help="Persistent Playwright/Chrome profile directory"),
+    ] = None,
+    chrome_path: Annotated[
+        Path | None,
+        typer.Option("--chrome-path", help="Google Chrome executable path"),
+    ] = None,
+    start_url: Annotated[
+        str,
+        typer.Option("--start-url", help="Initial URL to open in Chrome"),
+    ] = "https://www.elal.com/heb/israel",
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", help="Seconds to wait for a booking session", min=10),
+    ] = 300.0,
+    headless: Annotated[
+        bool,
+        typer.Option("--headless", help="Run browser headless"),
+    ] = False,
+) -> None:
+    """Open Chrome with Playwright and save EL AL booking session headers."""
+    method = method.lower().strip()
+    try:
+        credentials = None
+        if method in {"password", "sms"}:
+            credentials = load_elal_credentials(credentials_file)
+            if not credentials:
+                raise ValueError(
+                    "Browser password/sms login requires saved credentials. "
+                    "Run `itamx elal-login --save-credentials` first."
+                )
+
+        err_console.print(
+            "[dim]Opening Chrome. Complete EL AL login and navigate to a bonus search/results "
+            "page if the command does not auto-submit.[/dim]"
+        )
+        result = login_with_elal_browser(
+            credentials=credentials,
+            phone=phone,
+            method=method,
+            cdp_url=cdp_url,
+            profile_dir=profile_dir,
+            chrome_path=chrome_path,
+            start_url=start_url,
+            timeout=timeout,
+            headless=headless,
+        )
+        saved = save_elal_session(
+            result.headers,
+            session_file,
+            source=f"browser-{result.source}",
+        )
+    except (ElAlAwardAuthError, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"Saved EL AL session to [bold]{saved}[/bold]")
+    console.print(f"Captured via [bold]{result.source}[/bold]")
+
+
+@app.command(name="elal-awards")
+def elal_awards(
+    origin: Annotated[str, typer.Argument(help="Source IATA city or airport code")],
+    destination: Annotated[str, typer.Argument(help="Destination IATA city or airport code")],
+    depart: Annotated[str, typer.Argument(help="Depart date YYYY-MM-DD")],
+    ret: Annotated[
+        str | None,
+        typer.Argument(help="Return date YYYY-MM-DD (omit for one-way)"),
+    ] = None,
+    cabin: Annotated[
+        str,
+        typer.Option(
+            "--cabin",
+            "-c",
+            help="ALL, ECONOMY, PREMIUM_COACH, BUSINESS, or comma-separated E,P,B",
+        ),
+    ] = "ALL",
+    adults: Annotated[int, typer.Option("--adults", min=1, max=9)] = 1,
+    seniors: Annotated[int, typer.Option("--seniors", min=0, max=9)] = 0,
+    youths: Annotated[int, typer.Option("--youths", min=0, max=9)] = 0,
+    children: Annotated[int, typer.Option("--children", min=0, max=9)] = 0,
+    infants: Annotated[int, typer.Option("--infants", min=0, max=9)] = 0,
+    market: Annotated[str, typer.Option("--market", help="EL AL market code")] = "IL",
+    language: Annotated[str, typer.Option("--language", help="EL AL content language")] = "he",
+    promo_code: Annotated[str, typer.Option("--promo-code")] = "",
+    session_file: Annotated[
+        Path | None,
+        typer.Option("--session-file", help="Reusable EL AL session file"),
+    ] = None,
+    authorization: Annotated[
+        str | None,
+        typer.Option("--authorization", help="EL AL Authorization header or bare bearer token"),
+    ] = None,
+    cookie: Annotated[
+        str | None,
+        typer.Option("--cookie", help="EL AL Cookie header"),
+    ] = None,
+    output: Annotated[
+        SearchOutput, typer.Option("--output", "-o", help="Output format")
+    ] = SearchOutput.text,
+    top: Annotated[int, typer.Option("--top", help="Rows to show in text mode", min=1)] = 30,
+) -> None:
+    """Search EL AL Matmid award availability directly."""
+    pax = ElAlPaxCount(
+        adults=adults,
+        seniors=seniors,
+        youths=youths,
+        children=children,
+        infants=infants,
+    )
+    try:
+        with ElAlAwardClient(
+            session_path=session_file,
+            authorization=authorization,
+            cookie=cookie,
+            language=language,
+            market=market,
+        ) as client:
+            data = client.search_awards(
+                origin=origin,
+                destination=destination,
+                depart_date=depart,
+                return_date=ret,
+                cabin=cabin,
+                pax=pax,
+                market=market,
+                language=language,
+                promo_code=promo_code,
+            )
+    except (ElAlAwardAuthError, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    rows = data["results"]
+    if output == SearchOutput.raw:
+        print(json_module.dumps(data["raw"], indent=2, ensure_ascii=False))
+        return
+    if output == SearchOutput.json:
+        payload = {
+            "success": True,
+            "trip_type": data["trip_type"],
+            "count": len(rows),
+            "request": data["request"],
+            "results": rows,
+        }
+        print(json_module.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if output == SearchOutput.csv:
+        writer = csv_module.writer(sys.stdout)
+        writer.writerow(
+            [
+                "direction",
+                "flights",
+                "origin",
+                "destination",
+                "departure",
+                "arrival",
+                "duration",
+                "cabin",
+                "rbd",
+                "fare_family",
+                "points",
+                "tax",
+                "seats_left",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.get("direction"),
+                    " ".join(row.get("flights") or []),
+                    row.get("origin") or "",
+                    row.get("destination") or "",
+                    row.get("departure") or "",
+                    row.get("arrival") or "",
+                    row.get("duration_minutes") or "",
+                    row.get("cabin") or "",
+                    row.get("rbd") or "",
+                    row.get("fare_family") or "",
+                    row.get("points") or "",
+                    _format_elal_money(row.get("tax_amount"), row.get("tax_currency")),
+                    row.get("seats_left") or "",
+                ]
+            )
+        return
+
+    if not rows:
+        console.print("[yellow]No EL AL award results returned.[/yellow]")
+        return
+
+    table = Table(title=f"EL AL awards {origin.upper()} -> {destination.upper()}")
+    table.add_column("Dir")
+    table.add_column("Flights")
+    table.add_column("Depart")
+    table.add_column("Arrive")
+    table.add_column("Dur")
+    table.add_column("Cabin")
+    table.add_column("RBD")
+    table.add_column("Family")
+    table.add_column("Points", justify="right")
+    table.add_column("Tax", justify="right")
+    table.add_column("Seats", justify="right")
+    for row in rows[:top]:
+        duration = row.get("duration_minutes")
+        table.add_row(
+            "out" if row.get("direction") == "outbound" else "ret",
+            " ".join(row.get("flights") or []),
+            format_time(row.get("departure") or ""),
+            format_time(row.get("arrival") or ""),
+            format_duration(duration) if isinstance(duration, int) else "-",
+            row.get("cabin") or "-",
+            row.get("rbd") or "-",
+            row.get("fare_family") or "-",
+            _format_elal_points(row.get("points")),
+            _format_elal_money(row.get("tax_amount"), row.get("tax_currency")),
+            str(row.get("seats_left")) if row.get("seats_left") is not None else "-",
+        )
+    console.print(table)
+
+
+@app.command(name="elal-matrix")
+def elal_matrix(
+    origin: Annotated[str, typer.Argument(help="Source IATA city or airport code")],
+    destination: Annotated[str, typer.Argument(help="Destination IATA city or airport code")],
+    start_date: Annotated[str, typer.Argument(help="First depart date YYYY-MM-DD")],
+    end_date: Annotated[str, typer.Argument(help="Last depart date YYYY-MM-DD")],
+    adults: Annotated[int, typer.Option("--adults", min=1, max=9)] = 1,
+    seniors: Annotated[int, typer.Option("--seniors", min=0, max=9)] = 0,
+    youths: Annotated[int, typer.Option("--youths", min=0, max=9)] = 0,
+    children: Annotated[int, typer.Option("--children", min=0, max=9)] = 0,
+    infants: Annotated[int, typer.Option("--infants", min=0, max=9)] = 0,
+    market: Annotated[str, typer.Option("--market", help="EL AL market code")] = "IL",
+    language: Annotated[str, typer.Option("--language", help="EL AL content language")] = "he",
+    promo_code: Annotated[str, typer.Option("--promo-code")] = "",
+    session_file: Annotated[
+        Path | None,
+        typer.Option("--session-file", help="Reusable EL AL session file"),
+    ] = None,
+    authorization: Annotated[
+        str | None,
+        typer.Option("--authorization", help="EL AL Authorization header or bare bearer token"),
+    ] = None,
+    cookie: Annotated[
+        str | None,
+        typer.Option("--cookie", help="EL AL Cookie header"),
+    ] = None,
+    sleep_seconds: Annotated[
+        float,
+        typer.Option("--sleep", help="Pause between date probes", min=0),
+    ] = 0.15,
+    output: Annotated[
+        SearchOutput, typer.Option("--output", "-o", help="Output format")
+    ] = SearchOutput.text,
+) -> None:
+    """Scan EL AL saver award buckets across a departure date range.
+
+    Saver buckets are coach E, premium A, and business X.
+    """
+    start = _parse_iso_date_arg(start_date, "start_date")
+    end = _parse_iso_date_arg(end_date, "end_date")
+    if end < start:
+        raise typer.BadParameter("end_date must be on or after start_date")
+
+    pax = ElAlPaxCount(
+        adults=adults,
+        seniors=seniors,
+        youths=youths,
+        children=children,
+        infants=infants,
+    )
+    rows: list[dict] = []
+    errors: list[dict[str, str]] = []
+
+    try:
+        with ElAlAwardClient(
+            session_path=session_file,
+            authorization=authorization,
+            cookie=cookie,
+            language=language,
+            market=market,
+        ) as client:
+            current = start
+            while current <= end:
+                try:
+                    data = client.search_awards(
+                        origin=origin,
+                        destination=destination,
+                        depart_date=current.isoformat(),
+                        cabin="ALL",
+                        pax=pax,
+                        market=market,
+                        language=language,
+                        promo_code=promo_code,
+                    )
+                    for row in data.get("results") or []:
+                        if _elal_saver_class(row):
+                            rows.append(_elal_saver_record(current, row))
+                except Exception as exc:
+                    errors.append({"date": current.isoformat(), "error": str(exc)})
+                current += dt.timedelta(days=1)
+                if sleep_seconds:
+                    time.sleep(sleep_seconds)
+    except (ElAlAwardAuthError, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    rows.sort(
+        key=lambda row: (
+            row["date"],
+            {"coach": 0, "premium": 1, "business": 2}.get(str(row.get("award_class")), 9),
+            row.get("departure") or "",
+            row.get("points") if row.get("points") is not None else float("inf"),
+        )
+    )
+
+    payload = {
+        "success": not errors,
+        "count": len(rows),
+        "errors": errors,
+        "saver_buckets": {
+            "coach": "E",
+            "premium": "A",
+            "business": "X",
+        },
+        "request": {
+            "origin": origin.upper(),
+            "destination": destination.upper(),
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "passengers": {
+                "adults": adults,
+                "seniors": seniors,
+                "youths": youths,
+                "children": children,
+                "infants": infants,
+            },
+        },
+        "results": rows,
+    }
+
+    if output in (SearchOutput.json, SearchOutput.raw):
+        print(json_module.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    if output == SearchOutput.csv:
+        writer = csv_module.writer(sys.stdout)
+        writer.writerow(
+            [
+                "date",
+                "award_class",
+                "rbd",
+                "flight",
+                "origin",
+                "destination",
+                "departure",
+                "arrival",
+                "points",
+                "tax",
+                "seats_left",
+                "aircraft",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.get("date"),
+                    row.get("award_class"),
+                    row.get("rbd"),
+                    row.get("flight"),
+                    row.get("origin"),
+                    row.get("destination"),
+                    row.get("departure"),
+                    row.get("arrival"),
+                    row.get("points") or "",
+                    _format_elal_money(row.get("tax_amount"), row.get("tax_currency")),
+                    row.get("seats_left") or "",
+                    row.get("aircraft") or "",
+                ]
+            )
+        return
+
+    if not rows:
+        console.print("[yellow]No EL AL saver award buckets returned.[/yellow]")
+    else:
+        table = Table(title=f"EL AL saver awards {origin.upper()} -> {destination.upper()}")
+        table.add_column("Date")
+        table.add_column("Class")
+        table.add_column("RBD")
+        table.add_column("Flight")
+        table.add_column("To")
+        table.add_column("Depart")
+        table.add_column("Points", justify="right")
+        table.add_column("Tax", justify="right")
+        table.add_column("Seats", justify="right")
+        table.add_column("Aircraft")
+        for row in rows:
+            table.add_row(
+                str(row.get("date") or ""),
+                str(row.get("award_class") or ""),
+                str(row.get("rbd") or ""),
+                str(row.get("flight") or ""),
+                str(row.get("destination") or ""),
+                format_time(row.get("departure") or ""),
+                _format_elal_points(row.get("points")),
+                _format_elal_money(row.get("tax_amount"), row.get("tax_currency")),
+                str(row.get("seats_left")) if row.get("seats_left") is not None else "-",
+                str(row.get("aircraft") or ""),
+            )
+        console.print(table)
+
+    if errors:
+        console.print(f"[yellow]{len(errors)} dates returned EL AL warnings/errors.[/yellow]")
 
 
 @app.command(name="airlines")

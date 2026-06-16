@@ -60,6 +60,69 @@ itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output csv > prices.cs
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output raw    # full API response
 ```
 
+### `itamx elal-awards` — direct EL AL Matmid award search
+
+```bash
+# One-time setup from a browser-authenticated Matmid SSO cookie
+itamx elal-login --matmid-cookie '...'
+
+# Username/password entrypoint; EL AL currently blocks this before the form
+itamx elal-login --username "$ITAMX_ELAL_USERNAME" --password "$ITAMX_ELAL_PASSWORD"
+
+# Save/load credentials from ~/.config/itamx/elal-credentials.json
+itamx elal-login --username "$ITAMX_ELAL_USERNAME" --password "$ITAMX_ELAL_PASSWORD" --save-credentials
+itamx elal-login
+
+# Browser-assisted login with Playwright and visible Chrome
+uv sync --extra browser
+itamx elal-browser-login --method manual
+itamx elal-browser-login --method password
+itamx elal-browser-login --method sms --phone "$ITAMX_ELAL_PHONE"
+
+# Attach to a manually launched Chrome debug profile when Playwright launch is blocked
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.config/itamx/elal-cdp-profile"
+itamx elal-browser-login --cdp-url http://127.0.0.1:9222 --method manual --timeout 900
+
+# Then search without HAR/runtime capture
+itamx elal-awards TLV LON 2026-11-26 2026-12-01 --cabin BUSINESS -o json
+itamx elal-matrix TLV LON 2026-11-01 2026-12-31 -o csv
+
+# Advanced: save a booking cookie directly; the CLI mints the bearer token
+itamx elal-login --cookie 'BOOKINGSESSION=...; BOOKINGIDENTITY=...'
+```
+
+EL AL award search is not a Matrix search. It calls EL AL's own points endpoints
+(`booking/search/points/fast`, then outbound/inbound bound reads) and returns
+fare-family, RBD, points, taxes, seats-left, and segment data. The reversed
+booking flow is: create a BFM bearer session with `rest/session/create`, attach
+it as `Authorization: Bearer ...`, and use booking cookies from Matmid SAML SSO
+for account identity. `elal-login --username/--password` attempts the Matmid
+credential SSO shape first, but the live unauthenticated entrypoint currently
+returns Link11 access-denied before serving a password form. It does not bypass
+anti-bot, captcha, or MFA. The reliable path is still to save a reusable session
+in `~/.config/itamx/elal-session.json` after a browser-authenticated SSO/cookie
+handoff. If you opt into credential storage, the CLI writes
+`~/.config/itamx/elal-credentials.json` with file mode `0600` and loads it when
+`elal-login` is run without `--username`. `elal-browser-login` is the preferred
+fallback when raw login is blocked: it opens visible Chrome via Playwright,
+optionally fills the password/SMS form, waits for EL AL's own booking app to
+create or use a logged-in booking bearer, then saves that session for
+`elal-awards`. When EL AL shows a generic Hebrew "try again later" error from a
+fresh automation profile, start Chrome yourself with `--remote-debugging-port`
+and a non-default `--user-data-dir`, then pass `--cdp-url`; this avoids
+Playwright's launch path while keeping a reusable EL AL debug profile. Chrome
+136+ ignores remote debugging for the default profile, so `--user-data-dir` is
+required. It does not bypass Link11, reCAPTCHA, MFA, or SMS; complete those
+normally in the browser when prompted. HAR import is available only as a one-time
+migration helper:
+`itamx elal-login --import-har capture.har`.
+
+`elal-matrix` scans a departure-date range and returns only saver award buckets:
+coach `E`, premium `A`, and business `X`, including EL AL's `nbSeatLeft`
+availability count for each fare.
+
 ### `itamx flex` — find the cheapest week in a date range
 
 ```bash
@@ -202,9 +265,16 @@ The complete public surface:
 | Symbol | Purpose |
 |---|---|
 | `itamx.client.MatrixClient` | The HTTPS client. Methods: `search()`, `detail()`, `lookup_locations()` |
+| `itamx.elal.ElAlAwardClient` | Direct EL AL Matmid award client. Method: `search_awards()` |
 | `itamx.client.Slice` | Trip leg dataclass — source/destination/date + filters |
 | `itamx.client.PaxCount` | Passenger breakdown |
 | `itamx.client.build_search_body` | Compose a search payload without sending it (for inspection / replay) |
+| `itamx.elal.build_award_search_body` | Compose an EL AL points-search payload without sending it |
+| `itamx.elal.build_booking_session_body` | Compose EL AL's public BFM session-create payload |
+| `itamx.elal.bootstrap_elal_session_from_sso` | Exchange a browser-authenticated Matmid SSO cookie for reusable booking headers |
+| `itamx.elal.load_elal_credentials` / `save_elal_credentials` | Read/write local Matmid credentials file |
+| `itamx.elal.login_with_elal_browser` | Browser-assisted Playwright login/session capture |
+| `itamx.elal.login_with_elal_credentials` | Attempt Matmid credential SSO when EL AL serves a static login form |
 | `itamx.core.execute_flight_search` | Shared search service used by adapters |
 | `itamx.core.execute_flight_detail` | Shared search+detail service with segment/RBD output |
 | `itamx.airlines.search(query)` | Substring search, returns ranked list of airline dicts |

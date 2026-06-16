@@ -30,7 +30,10 @@ mcp = [
     "uvicorn>=0.34.0",
 ]
 all = [
-    "itamx[mcp]",
+    "itamx[browser,mcp]",
+]
+browser = [
+    "playwright>=1.60",
 ]
 
 [project.scripts]

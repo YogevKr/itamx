@@ -189,4 +189,9 @@ class RegressionTests(unittest.TestCase):
              "--ret-start", "2026-05-15"],
         )
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--ret-start and --ret-end must be used together", result.output)
+        # CI renders the typer error ANSI-colored and line-wrapped at a narrow
+        # terminal width, which splits the flag text mid-token; normalize
+        # (strip ANSI, collapse whitespace) before matching so it's robust.
+        import re as _re
+        normalized = _re.sub(r"\s+", " ", _re.sub(r"\x1b\[[0-9;]*m", "", result.output))
+        self.assertIn("--ret-start and --ret-end must be used together", normalized)

@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "name": "itamx EL AL Award Inspector",
+  "version": "0.1.1",
+  "description": "Shows detailed EL AL Matmid award availability and points-award filters on booking.elal.com.",
+  "permissions": [
+    "https://booking.elal.com/*",
+    "https://www.elal.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://booking.elal.com/*",
+        "https://www.elal.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    "page-hook.js"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "elal-awards@itamx.local"
+    }
+  }
+}

@@ -1725,6 +1725,46 @@ def _elal_header(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+def _elal_aspx_login(*, sessid: str, wraith_dir: Path, session_file: Path | None) -> None:
+    """Mint a MEMBER session via the legacy reCAPTCHA-free Matmid .aspx portal.
+
+    El Al's modern /api/login is reCAPTCHA-v3 gated, but the legacy SharePoint
+    portal (matmid.elal.com/.../Login.aspx) is not. This runs the Camoufox-based
+    login script IN THE WRAITH ENV (playwright 1.55 — the itamx env's 1.60 crashes
+    Camoufox on El Al's pages), which writes the member session (SMSESSION +
+    BOOKINGSESSION) to the itamx session file. Use the SAME sticky proxy sessid
+    for subsequent scans (the session is IP-bound).
+    """
+    import os
+    import subprocess
+
+    script = Path.home() / ".config" / "itamx" / "elal_aspx_login.py"
+    if not script.exists():
+        err_console.print(f"[red]missing login script: {script}[/red]")
+        raise typer.Exit(1)
+    if not (wraith_dir / "pyproject.toml").exists():
+        err_console.print(
+            f"[red]wraith repo not found at {wraith_dir}; pass --wraith-dir or set ITAMX_WRAITH_DIR[/red]"
+        )
+        raise typer.Exit(1)
+    env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)  # let `uv run --directory` pick the wraith env cleanly
+    env["CAP_SESSID"] = sessid
+    if session_file:
+        env["ELAL_SESSION_FILE"] = str(session_file)
+    console.print(
+        f"[cyan]Minting El Al MEMBER session via legacy .aspx portal "
+        f"(reCAPTCHA-free, sessid={sessid}) — Camoufox in {wraith_dir}...[/cyan]"
+    )
+    result = subprocess.run(
+        ["uv", "run", "--directory", str(wraith_dir), "python", str(script)],
+        env=env,
+    )
+    if result.returncode != 0:
+        err_console.print("[red]El Al .aspx login failed (see output above)[/red]")
+        raise typer.Exit(1)
+
+
 @app.command(name="elal-login")
 def elal_login(
     username: Annotated[
@@ -1780,10 +1820,29 @@ def elal_login(
         Path | None,
         typer.Option("--session-file", help="Where to save the reusable EL AL session"),
     ] = None,
+    aspx: Annotated[
+        bool,
+        typer.Option(
+            "--aspx",
+            help="Mint a MEMBER session via the legacy reCAPTCHA-free Matmid .aspx portal "
+            "(Camoufox in the wraith env; needs DataImpulse proxy creds). Unlocks member super-saver (rbd X).",
+        ),
+    ] = False,
+    sessid: Annotated[
+        str,
+        typer.Option("--sessid", help="Sticky DataImpulse residential session id for --aspx; use the SAME one for scans"),
+    ] = "elal1",
+    wraith_dir: Annotated[
+        Path,
+        typer.Option("--wraith-dir", help="Path to the wraith repo (Camoufox+playwright1.55) for --aspx", envvar="ITAMX_WRAITH_DIR"),
+    ] = Path.home() / "wraith",
     market: Annotated[str, typer.Option("--market", help="EL AL market code")] = "IL",
     language: Annotated[str, typer.Option("--language", help="EL AL content language")] = "he",
 ) -> None:
     """Create or save an EL AL booking session for later award searches."""
+    if aspx:
+        _elal_aspx_login(sessid=sessid, wraith_dir=wraith_dir, session_file=session_file)
+        return
     try:
         credentials_saved = None
         if not username and not password:

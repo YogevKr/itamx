@@ -1,3 +1,5 @@
+
+
 # itamx
 
 CLI for **ITA Matrix** airfare search — the engine behind Google Flights, Kayak, and most fare research — using its reverse-engineered JSON API. No browser automation, no scraping, ~1-second searches.
@@ -55,7 +57,7 @@ itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --out-routing "AIRLINE+ 
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --currency CURRENCY --sales-city SALES_CITY
 
 # Machine-readable
-itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output json | jq '.solutions[0]'
+itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output json | jq '.solutionList.solutions[0]'
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output csv > prices.csv
 itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE --output raw    # full API response
 ```
@@ -177,7 +179,7 @@ Every command supports machine-readable output (`-o json` or `-o csv`).
 Status text goes to stderr, so stdout stays a clean parse target:
 
 ```bash
-itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE -o json | jq '.solutions[0].displayTotal'
+itamx search SOURCE DESTINATION DEPART_DATE RETURN_DATE -o json | jq '.solutionList.solutions[0].displayTotal'
 ```
 
 Exit codes: `0` on success, `1` on search failure or no matches.

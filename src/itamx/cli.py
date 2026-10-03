@@ -394,7 +394,7 @@ def search(
         typer.Option(
             "--flex",
             help="Search ± N days around each date (Matrix dateModifier).",
-            min=0, max=7,
+            min=0, max=2,
         ),
     ] = 0,
     # Output

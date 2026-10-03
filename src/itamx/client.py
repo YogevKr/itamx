@@ -314,6 +314,8 @@ class MatrixClient:
                 return hit
 
         resp = self._post_batch(body, "/v1/search")
+        if "error" in resp:
+            raise RuntimeError(f"Matrix rejected the search: {resp['error'].get('message')}")
 
         if cache_ttl != 0:
             from itamx import cache as _cache

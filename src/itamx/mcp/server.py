@@ -55,7 +55,7 @@ def search_flights(
         str | None,
         Field(description="Return departure window, e.g. '18-24'"),
     ] = None,
-    flex_days: Annotated[int, Field(description="Date flexibility on each side", ge=0, le=7)] = 0,
+    flex_days: Annotated[int, Field(description="Date flexibility on each side", ge=0, le=2)] = 0,
     adults: Annotated[int, Field(description="Adult passengers", ge=1, le=9)] = 1,
     currency: Annotated[str | None, Field(description="ISO 4217 currency code")] = None,
     sales_city: Annotated[str | None, Field(description="IATA city code for point of sale")] = None,

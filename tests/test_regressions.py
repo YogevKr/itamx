@@ -195,3 +195,18 @@ class RegressionTests(unittest.TestCase):
         import re as _re
         normalized = _re.sub(r"\s+", " ", _re.sub(r"\x1b\[[0-9;]*m", "", result.output))
         self.assertIn("--ret-start and --ret-end must be used together", normalized)
+
+    def test_search_flex_capped_at_matrix_limit(self) -> None:
+        # Matrix rejects dateModifier outside 0..2; previously surfaced as "no solutions".
+        result = runner.invoke(
+            app, ["search", "SYD", "TYO", "2027-02-15", "2027-02-25", "--flex", "7"]
+        )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Invalid value", result.output)
+
+    def test_search_raises_on_matrix_input_error(self) -> None:
+        client = RecordingPostClient()
+        error = {"error": {"message": "dateModifier.plus cannot be 7", "type": "input"}}
+        with mock.patch.object(RecordingPostClient, "_post_batch", return_value=error):
+            with self.assertRaisesRegex(RuntimeError, "dateModifier"):
+                client.search([Slice("SYD", "TYO", "2027-02-15")], cache_ttl=0)

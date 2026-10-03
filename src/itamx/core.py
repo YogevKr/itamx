@@ -39,7 +39,7 @@ class FlightSearchParams(BaseModel):
     via: str | None = Field(None, description="Transit airport for both directions")
     outbound_time: str | None = Field(None, description="Outbound time window, e.g. '6-12'")
     return_time: str | None = Field(None, description="Return time window, e.g. '18-24'")
-    flex_days: int = Field(0, ge=0, le=7, description="Date flexibility on each side")
+    flex_days: int = Field(0, ge=0, le=2, description="Date flexibility on each side")
     adults: int = Field(1, ge=1, le=9)
     seniors: int = Field(0, ge=0, le=9)
     youths: int = Field(0, ge=0, le=9)

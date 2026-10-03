@@ -9,6 +9,7 @@
 - Replaced the starter package `hello()` with real public exports and version metadata.
 - Added core flight service functions and `show_flight_details` MCP tool.
 - Added opt-in live smoke tests for Matrix lookup, search, and detail endpoints.
+- Capped `--flex` / `flex_days` at 2 (Matrix's dateModifier limit) and raised on Matrix input errors instead of reporting no solutions.
 
 ## 0.2.0
 

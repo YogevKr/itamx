@@ -109,6 +109,14 @@ class RegressionTests(unittest.TestCase):
             },
         )
 
+    def test_search_sends_only_sorts_matrix_accepts(self) -> None:
+        client = RecordingPostClient()
+        slices = [Slice(origin="MAD", destination="SYD", date="2026-12-26")]
+
+        for sort, sent in (("price", "default"), ("arrivalTime", "default"), ("duration", "duration")):
+            client.search(slices, sorts=sort, cache_ttl=0)
+            self.assertEqual(client.body["inputs"]["sorts"], sent, sort)
+
     def test_parse_weekdays_accepts_known_values(self) -> None:
         self.assertEqual(parse_weekdays("sun, MON"), {6, 0})
         self.assertIsNone(parse_weekdays(""))

@@ -172,6 +172,14 @@ class PaxCount:
         return out
 
 
+# Matrix rejects the other sorts ("cannot sort by price"); callers re-sort client-side.
+_MATRIX_SORTS = {"default", "duration"}
+
+
+def _matrix_sort(sorts: str) -> str:
+    return sorts if sorts in _MATRIX_SORTS else "default"
+
+
 def build_search_body(
     slices: list[Slice],
     *,
@@ -202,7 +210,7 @@ def build_search_body(
         "firstDayOfWeek": "SUNDAY",
         "internalUser": False,
         "sliceIndex": 0,
-        "sorts": sorts,
+        "sorts": _matrix_sort(sorts),
         # Matrix uses 'PREMIUM-COACH' (hyphen) on the wire even though every
         # other docs / UI form is 'PREMIUM_COACH'. Translate quietly.
         "cabin": _normalize_cabin(cabin),
@@ -285,9 +293,9 @@ class MatrixClient:
         """Run a search. Returns the raw JSON response dict.
 
         `slices` may have any length: 1 (one-way), 2 (round-trip), or 3+ (multi-city).
-        `sorts`: "default" (Matrix's blend), "price", "duration", "departureTime",
-                 "arrivalTime". Note: the response always carries enough data to
-                 re-sort client-side; this just changes Matrix's chosen ordering.
+        `sorts`: "default" (Matrix's blend) or "duration"; Matrix rejects other
+                 sorts, so they fall back to "default". The response always carries
+                 enough data to re-sort client-side.
         `cache_ttl`: if set (seconds), check the on-disk cache first and store
                  fresh responses. Set 0 to skip the cache entirely. Default None
                  uses the cache module's DEFAULT_TTL_SECONDS.
@@ -401,7 +409,7 @@ class MatrixClient:
                 "firstDayOfWeek": "SUNDAY",
                 "internalUser": False,
                 "sliceIndex": 0,
-                "sorts": sorts,
+                "sorts": _matrix_sort(sorts),
                 "solution": f"{solution_set}/{solution_id}",
                 "cabin": _normalize_cabin(cabin),
                 "maxLegsRelativeToMin": 1 if max_stops is None else max_stops,

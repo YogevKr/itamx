@@ -866,6 +866,10 @@ def flex(
     parallel: Annotated[
         int, typer.Option("--parallel", "-p", help="Concurrent searches", min=1, max=8)
     ] = 3,
+    currency: Annotated[
+        str | None,
+        typer.Option("--currency", help="ISO 4217 code, e.g. USD or ILS"),
+    ] = None,
     scan_cabins: Annotated[
         bool,
         typer.Option(
@@ -957,7 +961,9 @@ def flex(
 
     al_list = [a for a in airlines.split(",")] if airlines else None
     routing = _build_cli_routing(al_list, via)
-    options = SearchOptions(cabin=cabin.upper(), max_stops=max_stops, page_size=20)
+    options = SearchOptions(
+        cabin=cabin.upper(), max_stops=max_stops, page_size=20, currency=currency
+    )
 
     def run_one(dep: str, ret: str | None) -> tuple[str, str | None, dict | None, dict[str, dict[int, set[str]]] | None, str | None]:
         slices = build_trip_slices(

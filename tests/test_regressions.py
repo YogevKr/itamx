@@ -155,6 +155,19 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Searching 3 (depart, return)", result.output)
 
+    def test_flex_passes_currency_to_search(self) -> None:
+        with mock.patch.object(
+            MatrixClient, "search", return_value={"solutionList": {"solutions": []}}
+        ) as search:
+            result = runner.invoke(
+                app,
+                ["flex", "MAD", "SYD", "2026-12-26", "2026-12-26",
+                 "--duration", "14", "--currency", "USD", "--output", "json"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(search.call_args.kwargs["currency"], "USD")
+
     def test_flex_rectangular_sweep_with_ret_window(self) -> None:
         # 2 depart × 3 return = 6 candidates.
         with mock.patch.object(MatrixClient, "search", return_value={"solutionList": {"solutions": []}}):

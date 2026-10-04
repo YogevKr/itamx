@@ -7,6 +7,7 @@ from itamx.cli import app
 from itamx.client import MatrixClient, Slice
 from itamx.render import extract_rbd, format_duration, price_float
 from itamx.request_options import SearchOptions
+from itamx.search_builder import build_routing
 from itamx.validation import parse_int_range, parse_weekdays
 
 
@@ -108,6 +109,11 @@ class RegressionTests(unittest.TestCase):
                 "sorts": "price",
             },
         )
+
+    def test_build_routing_joins_airlines_with_commas(self) -> None:
+        self.assertEqual(build_routing(["CZ"], None), "CZ+")
+        self.assertEqual(build_routing(["CZ", "MU"], None), "CZ,MU+")
+        self.assertEqual(build_routing(["CZ", "MU"], "PVG"), "CZ,MU+ PVG CZ,MU+")
 
     def test_parse_weekdays_accepts_known_values(self) -> None:
         self.assertEqual(parse_weekdays("sun, MON"), {6, 0})

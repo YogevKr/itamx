@@ -67,11 +67,8 @@ def build_routing(
     suffix = "+" if strict_airline else ""
     airline_token = None
     if airline_codes:
-        airline_token = (
-            f"{airline_codes[0]}{suffix}"
-            if len(airline_codes) == 1
-            else f"({'|'.join(airline_codes)}){suffix}"
-        )
+        # Matrix RouteLanguage separates alternatives with commas; "|" matches nothing.
+        airline_token = f"{','.join(airline_codes)}{suffix}"
 
     via_token = via.strip().upper() if via else None
     if airline_token and via_token:
